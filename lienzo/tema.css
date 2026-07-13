@@ -205,3 +205,37 @@ pre.salida {
 .cred input { flex: 1; min-width: 0; padding: 6px 10px; font-family: var(--mono); font-size: 12px; }
 
 ::selection { background: var(--cobre-suave); }
+
+/* ── Login (velo de sesión) ─────────────────────────── */
+#login-velo {
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--papel);
+}
+#login-card {
+  width: min(340px, 90vw);
+  background: var(--carta);
+  border: 1px solid var(--linea);
+  border-radius: var(--radio);
+  padding: 36px 32px;
+  display: flex; flex-direction: column; gap: 14px;
+}
+#login-card h2 { margin: 0; font-size: 1.5rem; letter-spacing: .02em; }
+#login-card p { margin: 0; color: var(--mut); font-size: .92rem; }
+#login-card label {
+  display: flex; flex-direction: column; gap: 6px;
+  font-size: .85rem; color: var(--mut);
+}
+#login-card input {
+  font: inherit; color: var(--tinta);
+  background: var(--papel);
+  border: 1px solid var(--linea);
+  border-radius: 10px; padding: 10px 12px;
+}
+#login-card input:focus { outline: none; border-color: var(--cobre); }
+#login-card button {
+  font: inherit; cursor: pointer; margin-top: 6px;
+  background: var(--cobre); color: var(--cobre-tinta);
+  border: none; border-radius: 10px; padding: 11px;
+}
+#login-card #login-error { color: var(--err); font-size: .85rem; }

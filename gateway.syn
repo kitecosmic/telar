@@ -21,6 +21,13 @@ recover e
     log "columna grupo ok"
 
 use "./flujos/nodos/base.syn" as base
+use "./seguridad.syn" as seg
+
+-- Login opcional (mismo token que el lienzo): protege SOLO las rutas
+-- administrativas (/entregas, /reenviar). Los webhooks /wh/* siguen públicos —
+-- su protección es por flujo (firma HMAC / header_secreto / verificación).
+task chequear_sesion(token)
+    give seg.sesion_valida(token)
 
 task encolar(fid, payload)
     let r be sql_exec("INSERT INTO cola (flujo, input, estado, created) VALUES (?, ?, 'pendiente', ?)", [fid, payload, now()])
@@ -62,6 +69,7 @@ task leer_secreto(nombre)
         give nothing
 
 serve on 7002
+    auth with chequear_sesion
     rate_limit 120 per minute
 
     describe
@@ -151,11 +159,11 @@ serve on 7002
         sql_exec("INSERT INTO entregas (flujo, payload, created) VALUES (?, ?, ?)", [params.fid, payload, now()])
         give created(recibir(params.fid, payload))
 
-    route "GET /entregas/:fid"
+    route "GET /entregas/:fid" requires auth
         give sql("SELECT rowid AS eid, payload, created FROM entregas WHERE flujo = ? ORDER BY created DESC LIMIT 30", [params.fid])
 
     -- Replay: re-encolar una entrega guardada tal cual llegó.
-    route "POST /reenviar/:eid"
+    route "POST /reenviar/:eid" requires auth
         let filas be sql("SELECT flujo, payload FROM entregas WHERE rowid = ?", [params.eid])
         when length(filas) == 0
             give not_found("esa entrega no existe")

@@ -19,6 +19,11 @@ db_open("./telar.db")
 sql_exec("CREATE TABLE IF NOT EXISTS versiones (flujo TEXT, grafo TEXT, motivo TEXT, created REAL)")
 
 use "./compilador/generar.syn" as gen
+use "./seguridad.syn" as seg
+
+-- Para `auth with` (login opcional por .env — ver seguridad.syn).
+task chequear_sesion(token)
+    give seg.sesion_valida(token)
 
 task guardar_version(fid, motivo)
     try
@@ -36,17 +41,39 @@ task nodo_con_config(n, cfg)
     give salida
 
 serve on 7000
+    auth with chequear_sesion
     static "./lienzo"
 
     -- Páginas: "/" la sirve static (index.html = home); el taller tiene ruta propia.
+    -- Las páginas son cáscaras públicas: los DATOS salen solo por /api/* con sesión.
     route "GET /taller"
         give html(read_file("./lienzo/taller.html"))
+
+    -- ── Login opcional (TELAR_USUARIO / TELAR_CLAVE en .env) ──
+    route "GET /api/sesion"
+        give {"login_requerido": seg.config_login() != nothing}
+
+    route "POST /api/login"
+        expect body {usuario: text, clave: text}
+        let cfg be seg.config_login()
+        when cfg == nothing
+            give {"ok": true, "token": "", "nota": "login deshabilitado — sin TELAR_USUARIO/TELAR_CLAVE en el .env"}
+        let b be json of request
+        let u_ok be constant_time_eq(cfg["usuario"], trim(b["usuario"]))
+        let c_ok be constant_time_eq(cfg["clave"], b["clave"])
+        when u_ok
+            when c_ok
+                log "🔓 sesión iniciada: " + cfg["usuario"]
+                give {"ok": true, "token": seg.emitir_token(cfg, 12), "usuario": cfg["usuario"], "expira_horas": 12}
+        sleep(1)
+        log "🔒 login fallido"
+        give fail(401, "usuario o clave incorrectos")
 
     describe
         about: "Lienzo de Telar — automatizaciones que se piden a la IA"
         api: ["GET /api/flujos — todos los grafos", "POST /api/pedir — construir un flujo desde lenguaje natural {pedido}", "POST /api/correr/:id — ejecutar un flujo (body = payload del trigger)", "GET /api/runs — últimas corridas", "GET /api/runs/:rid/snapshots — ctx por nodo de una corrida"]
 
-    route "GET /api/flujos"
+    route "GET /api/flujos" requires auth
         let flujos be []
         each e in list_dir("./compilador/grafos")
             when ends_with(e["name"], ".json")
@@ -57,7 +84,7 @@ serve on 7000
         give flujos
 
     -- Borrado (suave): guarda la versión y lo archiva — recuperable restaurando.
-    route "DELETE /api/flujos/:fid"
+    route "DELETE /api/flujos/:fid" requires auth
         when not matches(params.fid, "[a-z0-9_]+")
             give fail(400, "id de flujo inválido")
         let ruta be "./compilador/grafos/" + params.fid + ".json"
@@ -71,10 +98,10 @@ serve on 7000
         give {"borrado": params.fid, "nota": "recuperable desde versiones"}
 
     -- Historial de versiones de un flujo (motivo + fecha; el grafo queda en la base).
-    route "GET /api/flujos/:fid/versiones"
+    route "GET /api/flujos/:fid/versiones" requires auth
         give sql("SELECT rowid AS vid, motivo, created FROM versiones WHERE flujo = ? ORDER BY created DESC LIMIT 30", [params.fid])
 
-    route "POST /api/flujos/:fid/restaurar/:vid"
+    route "POST /api/flujos/:fid/restaurar/:vid" requires auth
         when not matches(params.fid, "[a-z0-9_]+")
             give fail(400, "id de flujo inválido")
         let filas be sql("SELECT grafo FROM versiones WHERE rowid = ? AND flujo = ?", [params.vid, params.fid])
@@ -93,7 +120,7 @@ serve on 7000
         give {"ok": true, "restaurado": params.vid}
 
     -- Chat del telar (flujo entero) y consultas — proxies al builder.
-    route "POST /api/flujos/:fid/pedir"
+    route "POST /api/flujos/:fid/pedir" requires auth
         expect body {pedido: text}
         let b be json of request
         let forzar be when contains(b, "forzar") then b["forzar"] otherwise false
@@ -102,7 +129,7 @@ serve on 7000
             give respond(body of r, "application/json", status of r)
         give fail(502, "builder no disponible")
 
-    route "POST /api/flujos/:fid/consultar"
+    route "POST /api/flujos/:fid/consultar" requires auth
         expect body {pregunta: text}
         let r be http_post("http://127.0.0.1:7001/consultar", json_encode({"flujo": params.fid, "pregunta": (json of request)["pregunta"]}), {"Content-Type": "application/json"}, 540)
         when (status of r) >= 200
@@ -110,7 +137,7 @@ serve on 7000
         give fail(502, "builder no disponible")
 
     -- El .syn compilado del flujo, para "ver el código" nodo por nodo.
-    route "GET /api/flujos/:fid/fuente"
+    route "GET /api/flujos/:fid/fuente" requires auth
         when not matches(params.fid, "[a-z0-9_]+")
             give fail(400, "id de flujo inválido")
         when not file_exists("./flujos/" + params.fid + ".syn")
@@ -119,7 +146,7 @@ serve on 7000
 
     -- Edición manual del JSON de config de un nodo. Recompila y valida:
     -- si no compila, restaura el flujo como estaba y devuelve el error.
-    route "POST /api/flujos/:fid/nodos/:nid"
+    route "POST /api/flujos/:fid/nodos/:nid" requires auth
         expect body {config: map}
         when not matches(params.fid, "[a-z0-9_]+")
             give fail(400, "id de flujo inválido")
@@ -146,7 +173,7 @@ serve on 7000
 
     -- Ensayar UN nodo con un ctx dado (fase 3.3). modo: "ensayo" (default,
     -- efectos en seco) o "real" (opt-in). Nunca toca runs/snapshots.
-    route "POST /api/flujos/:fid/nodos/:nid/ensayar"
+    route "POST /api/flujos/:fid/nodos/:nid/ensayar" requires auth
         when not matches(params.fid, "[a-z0-9_]+")
             give fail(400, "id de flujo inválido")
         when not file_exists("./compilador/grafos/" + params.fid + ".json")
@@ -162,7 +189,7 @@ serve on 7000
             give fail(500, "el ensayo no devolvió JSON: " + slice(r["stdout"] + r["stderr"], 0, 400))
 
     -- Chat por nodo: proxy al builder ("cambiá solo este nodo").
-    route "POST /api/flujos/:fid/nodos/:nid/pedir"
+    route "POST /api/flujos/:fid/nodos/:nid/pedir" requires auth
         expect body {pedido: text}
         let b be json of request
         let forzar be when contains(b, "forzar") then b["forzar"] otherwise false
@@ -171,12 +198,12 @@ serve on 7000
             give respond(body of r, "application/json", status of r)
         give fail(502, "builder no disponible")
 
-    route "GET /api/runs"
+    route "GET /api/runs" requires auth
         give sql("SELECT id, flujo, estado, created FROM runs ORDER BY created DESC LIMIT 100")
 
     -- Eco local para probar integraciones sin depender de servicios externos:
     -- devuelve los headers y el body tal como llegaron.
-    route "POST /api/echo"
+    route "POST /api/echo" requires auth
         give {"recibido": true, "headers": headers of request, "body": json of request}
 
     -- ── Credenciales: Telar edita el .env por vos ──
@@ -184,7 +211,7 @@ serve on 7000
     -- así que guardar acá alcanza — sin reiniciar nada.
 
     -- Solo los NOMBRES (nunca los valores).
-    route "GET /api/credenciales"
+    route "GET /api/credenciales" requires auth
         let nombres be []
         try
             each linea in split(read_file("./.env"), "\n")
@@ -196,7 +223,7 @@ serve on 7000
             log "sin .env todavía"
         give nombres
 
-    route "POST /api/credenciales"
+    route "POST /api/credenciales" requires auth
         expect body {nombre: text, valor: text}
         let b be json of request
         let nombre be trim(b["nombre"])
@@ -224,7 +251,7 @@ serve on 7000
         log "🔑 credencial guardada: " + nombre + " (valor redactado)"
         give created({"guardada": nombre})
 
-    route "DELETE /api/credenciales/:nombre"
+    route "DELETE /api/credenciales/:nombre" requires auth
         when not matches(params.nombre, "[A-Z][A-Z0-9_]*")
             give fail(422, "nombre inválido")
         let contenido be ""
@@ -245,11 +272,11 @@ serve on 7000
         log "🗑 credencial borrada: " + params.nombre
         give {"borrada": params.nombre}
 
-    route "GET /api/runs/:rid/snapshots"
+    route "GET /api/runs/:rid/snapshots" requires auth
         give sql("SELECT nodo, ctx, created FROM snapshots WHERE run_id = ? ORDER BY created", [params.rid])
 
     -- Proxy al builder: la UI habla con un solo origen.
-    route "POST /api/pedir"
+    route "POST /api/pedir" requires auth
         expect body {pedido: text}
         log "📥 pedido → builder: " + (json of request)["pedido"]
         let b be json of request
@@ -263,7 +290,7 @@ serve on 7000
         give fail(502, "builder no disponible — ¿está corriendo `synsema serve builder.syn`?")
 
     -- Ejecuta un flujo como proceso efímero (rol del worker, v1 acá).
-    route "POST /api/correr/:fid"
+    route "POST /api/correr/:fid" requires auth
         when not matches(params.fid, "[a-z0-9_]+")
             give fail(400, "id de flujo inválido")
         when not file_exists("./flujos/" + params.fid + ".syn")

@@ -35,6 +35,18 @@ legible, testeado y con permisos imposibles de violar**.
 | gateway | :7002 | webhooks públicos `POST /wh/<flujo>` + firma HMAC + replay |
 | worker  | —     | ejecuta la cola y dispara los triggers cron |
 
+**Login (opcional, recomendado fuera de tu PC)** — dos variables en el `.env`:
+```
+TELAR_USUARIO=admin
+TELAR_CLAVE=una-clave-larga-y-dificil-de-adivinar
+```
+Con eso la UI pide usuario y clave (sesión de 12 h con token firmado
+HMAC-SHA256 — la clave nunca viaja), toda la API del lienzo exige sesión, y en el
+gateway también `/entregas` y `/reenviar`. Los webhooks `/wh/*` siguen públicos:
+su protección es por flujo (abajo). Sin las variables, Telar corre abierto (modo
+local). Si exponés Telar a internet: publicá SOLO :7000 y :7002 — el builder
+(:7001) y el worker son internos.
+
 **Protección de webhooks — opcional y por flujo** (un webhook simple no lleva ninguna
 y entra directo). Tres niveles, según lo que use el emisor:
 - `"firma": {"header": "X-Hub-Signature-256", "secreto": "VAR", "prefijo": "sha256="}` —
@@ -446,6 +458,18 @@ la respuesta no trae `json`, usar `json_decode(body of r)`; cron roto).
   "¡Buenas! Decime qué necesitás" ante "¿cuánto sale el tomate? ¿tenés lechuga?"; la
   versión libre respondió las dos preguntas y ofreció tomar el pedido.
 
+- **Fase 5.2 (hecha) — login y licencia:** `seguridad.syn` (módulo compartido) + dos
+  variables en el `.env` (`TELAR_USUARIO`/`TELAR_CLAVE`) activan el login: la UI muestra
+  un velo de ingreso y toda la API del lienzo + `/entregas` y `/reenviar` del gateway
+  exigen sesión (`auth with` nativo de Synsema; token Bearer `expira.firma` con
+  HMAC-SHA256 sobre la clave — la clave nunca viaja ni se loguea; 12 h de vida;
+  comparaciones en tiempo constante; 1 s de castigo por login fallido). Los webhooks
+  `/wh/*` siguen públicos (protección por flujo) y las páginas estáticas son cáscaras
+  sin datos. Sin las variables, Telar corre abierto (modo local) — y como el `.env` se
+  lee fresco en cada request, activar/desactivar el login no requiere reiniciar.
+  Verificado E2E: 401 sin/mal/vencido token, login ok → 200, gateway admin protegido,
+  webhook público intacto. Licencia: Apache 2.0 (`LICENSE`).
+
 ## Riesgos honestos
 
 - **Conectores:** n8n tiene 400+; acá cada integración es HTTP escrito por el LLM. Mitigación: el nodo Synsema custom + promoción al catálogo (ver arriba) — cada integración que alguien pidió una vez queda testeada y reutilizable.
@@ -459,3 +483,7 @@ la respuesta no trae `json`, usar `json_decode(body of r)`; cron roto).
 escribir código era la barrera. Si la IA escribe, testea y explica el código —
 lo que necesitás no es un editor de nodos: es un runtime seguro, auditable y sin
 lock-in donde ese código pueda vivir. Eso es Synsema + Telar.*
+
+## Licencia
+
+[Apache 2.0](LICENSE).

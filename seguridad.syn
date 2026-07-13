@@ -1,0 +1,55 @@
+-- Telar · seguridad — login opcional definido en el .env:
+--     TELAR_USUARIO=admin
+--     TELAR_CLAVE=una-clave-larga-y-random
+-- Sin esas variables, Telar corre ABIERTO (modo local de desarrollo). Con ellas,
+-- las rutas de la UI (lienzo) y las administrativas del gateway exigen un token
+-- Bearer firmado: "<expira>.<hmac_sha256(TELAR_CLAVE, 'telar-sesion.' + expira)>".
+-- La clave nunca sale del servidor ni viaja en el token; solo viaja la firma.
+-- Módulo compartido: lo importan lienzo.syn y gateway.syn (require file + time).
+
+export task config_login()
+    try
+        let usuario be ""
+        let clave be ""
+        each linea in split(read_file("./.env"), "\n")
+            let m be capture(trim(linea), "^TELAR_USUARIO=(.+)$")
+            when m != nothing
+                let u be when type_of(m) == "list" then m[0] otherwise m
+                set usuario to trim(u)
+            let m2 be capture(trim(linea), "^TELAR_CLAVE=(.+)$")
+            when m2 != nothing
+                let c be when type_of(m2) == "list" then m2[0] otherwise m2
+                set clave to trim(c)
+        when usuario != ""
+            when clave != ""
+                give {"usuario": usuario, "clave": clave}
+        give nothing
+    recover e
+        give nothing
+
+export task emitir_token(cfg, horas)
+    let expira be text(round(now()) + round(horas * 3600))
+    give expira + "." + hmac_sha256(as_secret(cfg["clave"]), "telar-sesion." + expira)
+
+-- Para `auth with`: recibe el token Bearer (texto). Devuelve el usuario si la
+-- sesión vale, o nothing (→ 401 automático). Sin login configurado, deja pasar.
+export task sesion_valida(token)
+    let cfg be config_login()
+    when cfg == nothing
+        give {"usuario": "local", "abierto": true}
+    when token == ""
+        give nothing
+    let partes be split(token, ".")
+    when length(partes) != 2
+        give nothing
+    let expira be 0
+    try
+        set expira to number(partes[0])
+    recover e
+        give nothing
+    when expira < now()
+        give nothing
+    let firma be hmac_sha256(as_secret(cfg["clave"]), "telar-sesion." + partes[0])
+    when constant_time_eq(firma, partes[1])
+        give {"usuario": cfg["usuario"]}
+    give nothing
