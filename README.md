@@ -69,11 +69,24 @@ memoria + respuesta con IA + envío por la API). Los pasos:
 3. **Cargar credenciales en el panel** (Inicio → Credenciales — nunca por chat):
    `TELEGRAM_BOT_TOKEN` (el de BotFather) y `TELEGRAM_WH_SECRET` (inventalo vos:
    random y largo).
-4. **Túnel + registro** (el túnel quick de cloudflared cambia de URL en cada arranque):
+4. **Registrar el webhook** — Telegram necesita una URL pública que llegue a tu
+   gateway (:7002). Según tu caso:
+
+   *Con dominio propio* (producción — lo normal si Telar corre en un servidor):
+   apuntá el dominio al gateway (reverse proxy o `--tls-auto`) y registrá **una
+   sola vez** — queda registrado aunque reinicies Telar:
+   ```
+   URL_PUBLICA=https://telar.tudominio.com synsema run conectar_telegram.syn
+   ```
+
+   *Sin dominio* (desarrollo en tu PC): un túnel efímero hace de URL pública.
+   Ojo: el túnel quick cambia de URL en cada arranque → re-corré el registro
+   con la URL nueva cada vez:
    ```
    cloudflared tunnel --url http://127.0.0.1:7002
-   TUNNEL_URL=https://<lo-que-te-dio>.trycloudflare.com synsema run conectar_telegram.syn
+   URL_PUBLICA=https://<lo-que-te-dio>.trycloudflare.com synsema run conectar_telegram.syn
    ```
+
    El script llama a `setWebhook` con tu secret y te muestra el estado según Telegram.
    Si tu flujo no se llama `telegram_bot`, agregá `TELEGRAM_FLUJO=<id_de_tu_flujo>`.
 

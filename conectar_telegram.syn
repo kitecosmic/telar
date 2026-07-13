@@ -2,8 +2,18 @@
 --   Antes: cargá en el panel Credenciales (o .env):
 --     TELEGRAM_BOT_TOKEN   (te lo da @BotFather)
 --     TELEGRAM_WH_SECRET   (inventalo vos: un string random largo)
---   Después, con el túnel corriendo (cloudflared tunnel --url http://127.0.0.1:7002):
---     TUNNEL_URL=https://tu-tunel.trycloudflare.com synsema run conectar_telegram.syn
+--   Después pasale la URL PÚBLICA donde Telegram puede alcanzar tu gateway (:7002):
+--
+--     · Producción (dominio propio apuntando al gateway):
+--         URL_PUBLICA=https://telar.tudominio.com synsema run conectar_telegram.syn
+--       Se corre UNA sola vez: el webhook queda registrado aunque reinicies Telar.
+--
+--     · Desarrollo (sin dominio, tu PC): un túnel efímero hace de URL pública:
+--         cloudflared tunnel --url http://127.0.0.1:7002
+--         URL_PUBLICA=https://<lo-que-te-dio>.trycloudflare.com synsema run conectar_telegram.syn
+--       El túnel quick cambia de URL en cada arranque → re-corré esto con la nueva.
+--
+--   (TUNNEL_URL sigue aceptándose como alias de URL_PUBLICA.)
 --   Si tu flujo no se llama "telegram_bot", pasá también TELEGRAM_FLUJO=<id_de_tu_flujo>.
 --
 -- Nota: Telegram lleva el token en la URL (diseño de ellos, no nuestro) — por
@@ -17,13 +27,13 @@ require net("api.telegram.org")
 task principal()
     let token be env("TELEGRAM_BOT_TOKEN", "")
     let secreto be env("TELEGRAM_WH_SECRET", "")
-    let tunel be env("TUNNEL_URL", "")
+    let tunel be env("URL_PUBLICA", env("TUNNEL_URL", ""))
     when token == ""
         give "Falta TELEGRAM_BOT_TOKEN — cargalo en el panel Credenciales (te lo da @BotFather)."
     when secreto == ""
         give "Falta TELEGRAM_WH_SECRET — inventá un string random largo y cargalo en Credenciales."
     when tunel == ""
-        give "Falta TUNNEL_URL — corré:  cloudflared tunnel --url http://127.0.0.1:7002  y pasá la URL:  TUNNEL_URL=https://… synsema run conectar_telegram.syn"
+        give "Falta URL_PUBLICA — la URL donde Telegram alcanza tu gateway. Con dominio propio:  URL_PUBLICA=https://telar.tudominio.com synsema run conectar_telegram.syn  · Sin dominio (dev):  cloudflared tunnel --url http://127.0.0.1:7002  y pasá la URL que te dio."
     let destino be tunel + "/wh/" + env("TELEGRAM_FLUJO", "telegram_bot")
     let r be http_post("https://api.telegram.org/bot" + token + "/setWebhook", json_encode({"url": destino, "secret_token": secreto, "allowed_updates": ["message"]}), {"Content-Type": "application/json"})
     when not (ok of r)
