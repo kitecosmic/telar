@@ -4,6 +4,7 @@
 --     TELEGRAM_WH_SECRET   (inventalo vos: un string random largo)
 --   Después, con el túnel corriendo (cloudflared tunnel --url http://127.0.0.1:7002):
 --     TUNNEL_URL=https://tu-tunel.trycloudflare.com synsema run conectar_telegram.syn
+--   Si tu flujo no se llama "telegram_bot", pasá también TELEGRAM_FLUJO=<id_de_tu_flujo>.
 --
 -- Nota: Telegram lleva el token en la URL (diseño de ellos, no nuestro) — por
 -- eso acá se usa env() y no secret(). No se imprime nunca.
@@ -23,7 +24,7 @@ task principal()
         give "Falta TELEGRAM_WH_SECRET — inventá un string random largo y cargalo en Credenciales."
     when tunel == ""
         give "Falta TUNNEL_URL — corré:  cloudflared tunnel --url http://127.0.0.1:7002  y pasá la URL:  TUNNEL_URL=https://… synsema run conectar_telegram.syn"
-    let destino be tunel + "/wh/telegram_bot"
+    let destino be tunel + "/wh/" + env("TELEGRAM_FLUJO", "telegram_bot")
     let r be http_post("https://api.telegram.org/bot" + token + "/setWebhook", json_encode({"url": destino, "secret_token": secreto, "allowed_updates": ["message"]}), {"Content-Type": "application/json"})
     when not (ok of r)
         give "setWebhook falló (" + text(status of r) + "): " + slice(body of r, 0, 300)

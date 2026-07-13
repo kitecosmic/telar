@@ -56,22 +56,26 @@ silencio sin mensajes nuevos, el worker las une y corre **una sola vez** con
 `{"mensajes": [payloads en orden], "grupo": remitente}`. Cada remitente es un grupo
 independiente. El builder ya lo genera si le contás que es un canal de mensajes.
 
-## Conectar tu bot de Telegram (casi listo — faltan tus 3 pasos)
+## Conectar tu bot de Telegram (4 pasos)
 
-La cañería ya está: flujo `telegram_bot` (secret de header + debounce de ráfagas +
-respuesta con IA + envío por la API), túnel probado de punta a punta, y el script
-de registro. Lo que solo vos podés hacer:
+La cañería está probada de punta a punta (secret de header + debounce de ráfagas +
+memoria + respuesta con IA + envío por la API). Los pasos:
 
 1. **Crear el bot**: hablale a `@BotFather` en Telegram → `/newbot` → copiá el token.
-2. **Cargar credenciales en el panel** (Inicio → Credenciales — nunca por chat):
-   `TELEGRAM_BOT_TOKEN` (el de BotFather) y `TELEGRAM_WH_SECRET` (reemplazá el valor
-   de prueba `secreto-prueba-telegram-999` por uno tuyo, random y largo).
-3. **Túnel + registro** (el túnel quick de cloudflared cambia de URL en cada arranque):
+2. **Tejer el flujo**: pedíselo al builder desde el home, por ejemplo: *"un bot de
+   Telegram con IA: agrupa mensajes seguidos, recuerda la conversación y responde
+   por la API de Telegram usando TELEGRAM_BOT_TOKEN; webhook protegido con
+   TELEGRAM_WH_SECRET"*. Anotá el id que le puso (ej. `telegram_bot`).
+3. **Cargar credenciales en el panel** (Inicio → Credenciales — nunca por chat):
+   `TELEGRAM_BOT_TOKEN` (el de BotFather) y `TELEGRAM_WH_SECRET` (inventalo vos:
+   random y largo).
+4. **Túnel + registro** (el túnel quick de cloudflared cambia de URL en cada arranque):
    ```
    cloudflared tunnel --url http://127.0.0.1:7002
    TUNNEL_URL=https://<lo-que-te-dio>.trycloudflare.com synsema run conectar_telegram.syn
    ```
    El script llama a `setWebhook` con tu secret y te muestra el estado según Telegram.
+   Si tu flujo no se llama `telegram_bot`, agregá `TELEGRAM_FLUJO=<id_de_tu_flujo>`.
 
 Escribile 2-3 mensajes seguidos al bot → **una** respuesta con todo el contexto.
 
