@@ -1,0 +1,14 @@
+-- Telar · builder/mcp.syn — cliente MCP (streamable HTTP) de docs.synsema.com.
+-- El mismo servidor de documentación que usa el editor: el LLM del builder puede
+-- buscar en la doc oficial, leer páginas y correr código Synsema en un sandbox.
+-- El entrypoint que importe esto necesita: require net("docs.synsema.com").
+
+export task herramienta(nombre, args)
+    let cuerpo be json_encode({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": nombre, "arguments": args}})
+    let r be http_post("https://docs.synsema.com/mcp", cuerpo, {"Content-Type": "application/json"})
+    when not (ok of r)
+        give "el MCP de la doc respondió status " + text(status of r) + ": " + slice(body of r, 0, 200)
+    let j be json_decode(body of r)
+    when contains(j, "error")
+        give "error del MCP: " + json_encode(j["error"])
+    give j["result"]["content"][0]["text"]

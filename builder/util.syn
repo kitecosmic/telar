@@ -1,0 +1,103 @@
+-- Telar · builder/util — tasks puras del builder, testeables sin serve.
+--   Tests:  cd telar && synsema test builder/util.syn
+
+-- Todos los objetos JSON balanceados de primer nivel dentro de un texto.
+-- Respeta strings y escapes: las llaves de un {tpl} adentro de comillas no cuentan.
+export task objetos_en(t)
+    let lista be []
+    let n be length(t)
+    let i be 0
+    let inicio be nothing
+    let prof be 0
+    let en_str be false
+    let esc be false
+    while i < n
+        let c be slice(t, i, i + 1)
+        when en_str
+            when esc
+                set esc to false
+            otherwise
+                when c == "\\"
+                    set esc to true
+                when c == "\""
+                    set en_str to false
+        otherwise
+            when c == "\""
+                set en_str to true
+            when c == "{"
+                when prof == 0
+                    set inicio to i
+                set prof to prof + 1
+            when c == "}"
+                when prof > 0
+                    set prof to prof - 1
+                    when prof == 0
+                        when inicio != nothing
+                            set lista to append(lista, slice(t, inicio, i + 1))
+                            set inicio to nothing
+        set i to i + 1
+    give lista
+
+export task extraer_json(t)
+    let limpio be trim(replace_text(replace_text(t, "```json", ""), "```", ""))
+    try
+        give json_decode(limpio)
+    recover e1
+        -- puede venir prosa + JSON, o VARIOS objetos: pruebo el primero que parsee
+        each o in objetos_en(limpio)
+            try
+                give json_decode(o)
+            recover e2
+                let sigo be true
+        raise("no encontré un JSON válido en la respuesta del modelo")
+
+export task permisos_de(codigo)
+    give where(split(codigo, "\n"), (l) => starts_with(l, "require "))
+
+-- Guardián: ¿el pedido parece contener una credencial pegada?
+-- El valor de una key JAMÁS debe viajar al LLM — solo su nombre de variable.
+-- Detecta por CONTEXTO (palabras tipo key/token/secret al lado del valor) para
+-- no confundir ids largos inocentes (exports de n8n, hashes) con credenciales.
+-- Devuelve el fragmento hallado, o nothing.
+export task hallar_credencial(t)
+    each p in ["sk-[A-Za-z0-9_\\-]{10,}", "(?i)bearer\\s+[A-Za-z0-9._\\-]{15,}", "eyJ[A-Za-z0-9_\\-]{20,}\\.[A-Za-z0-9._\\-]{10,}", "(?i)(api[_-]?key|apikey|token|secret|password|passwd|clave)[\"'`:=\\s]{1,5}[A-Za-z0-9+/=._\\-]{16,}"]
+        let m be find_all(t, p)
+        when length(m) > 0
+            give m[0]
+    give nothing
+
+export task parece_credencial(t)
+    give hallar_credencial(t) != nothing
+
+test "extraer_json tolera fences y prosa alrededor"
+    let g be extraer_json("```json\n{\"a\": 1}\n```")
+    assert_eq(g["a"], 1)
+    let g2 be extraer_json("acá va:\n{\"b\": {\"c\": 2}}\nlisto")
+    assert_eq(g2["b"]["c"], 2)
+
+test "extraer_json elige el primer objeto válido entre varios"
+    let g be extraer_json("{\"herramienta\": \"get_page\", \"args\": {\"slug\": \"10-syntax\"}}\ny después haría\n{\"otro\": 1}")
+    assert_eq(g["herramienta"], "get_page")
+
+test "extraer_json no cuenta llaves adentro de strings"
+    let g be extraer_json("el grafo: {\"tpl\": \"hola {nodo.campo} fin\", \"n\": 2} listo")
+    assert_eq(g["n"], 2)
+
+test "permisos_de extrae los require"
+    let p be permisos_de("intent: \"x\"\nrequire llm\nrequire db(\"./x.db\")\nlet a be 1")
+    assert_eq(length(p), 2)
+
+test "parece_credencial caza keys pegadas"
+    assert_eq(parece_credencial("usa la key sk-abc123def456ghi789jkl"), true)
+    assert_eq(parece_credencial("con Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"), true)
+    assert_eq(parece_credencial("\"apiKey\": \"dGVzdC10b2tlbi1sYXJnbzEyMzQ1\""), true)
+    assert_eq(parece_credencial("token=Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MA"), true)
+
+test "hallar_credencial devuelve el fragmento encontrado"
+    let h be hallar_credencial("usa la key sk-abc123def456ghi789jkl por favor")
+    assert(starts_with(h, "sk-abc123"))
+
+test "parece_credencial no molesta con pedidos normales ni exports de n8n"
+    assert_eq(parece_credencial("cuando llegue una venta por webhook avisame por WhatsApp con Evolution API"), false)
+    assert_eq(parece_credencial("guardalo en la tabla consultas con categoria reenviado"), false)
+    assert_eq(parece_credencial("{\"webhookId\": \"a1b2c3d4-e5f6-7890-abcd-ef1234567890\", \"instanceId\": \"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\"}"), false)

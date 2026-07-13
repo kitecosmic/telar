@@ -1,0 +1,13 @@
+-- Telar · nodos/sql — consulta y ejecución sobre la conexión abierta por el flujo.
+-- Wrappers finos sobre builtins: la lógica testeable (resolver) vive en base.syn.
+-- La capability `db(...)` la declara el flujo compilado, no este módulo.
+
+use "./base.syn" as base
+
+export task consultar(ctx, cfg)
+    let params be when contains(cfg, "params") then base.resolver_lista(ctx, cfg["params"]) otherwise []
+    give sql(cfg["query"], params)
+
+export task ejecutar(ctx, cfg)
+    let params be when contains(cfg, "params") then base.resolver_lista(ctx, cfg["params"]) otherwise []
+    give sql_exec(cfg["stmt"], params)

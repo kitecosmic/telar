@@ -1,0 +1,116 @@
+-- Telar · ensayar — corre UN nodo de un flujo con un ctx dado, sin tocar las
+-- corridas de prueba ni de producción.
+--   Invocado por el lienzo:  TELAR_FLUJO, TELAR_NODO, TELAR_CTX (json),
+--   TELAR_MODO=ensayo|real →  synsema run ensayar.syn  → imprime UN json.
+--
+-- Política por tipo de nodo:
+--   · puros (condicion, custom sin requires) y lecturas (sql_query, llm_decide)
+--     → se ejecutan DE VERDAD (no tienen efectos).
+--   · con efectos (sql_exec, http, archivo, custom con requires) → en "ensayo"
+--     muestran QUÉ HARÍAN (SQL/params resueltos, request armada con secretos
+--     redactados, contenido del archivo); en "real" ejecutan (opt-in).
+
+intent: "Ensayar un solo nodo de un flujo Telar con una entrada dada"
+
+require env("TELAR_*")
+require db("./telar.db")
+require net
+require file
+require llm
+require time
+require exec("synsema")
+
+use "./flujos/nodos/base.syn" as base
+use "./flujos/nodos/sql.syn" as n_sql
+use "./flujos/nodos/http.syn" as n_http
+use "./flujos/nodos/condicion.syn" as n_cond
+use "./flujos/nodos/llm.syn" as n_llm
+use "./flujos/nodos/archivo.syn" as n_arch
+
+let FLUJO be env("TELAR_FLUJO")
+let NODO be env("TELAR_NODO")
+let MODO be env("TELAR_MODO", "ensayo")
+let CTX be json_decode(env("TELAR_CTX", "{}"))
+
+-- Resolución "seca": como base.resolver pero SIN materializar secretos —
+-- muestra un placeholder legible (y no necesita capability de secretos).
+task resolver_seco(ctx, item)
+    when type_of(item) == "map"
+        when contains(item, "secret")
+            give "«secreto:" + item["secret"] + "»"
+        when contains(item, "bearer")
+            give "Bearer «secreto:" + item["bearer"] + "»"
+    give base.resolver(ctx, item)
+
+task lista_seca(ctx, items)
+    give apply((x) => resolver_seco(ctx, x), items)
+
+task map_seco(ctx, m)
+    let salida be {}
+    each k in keys(m)
+        set salida[k] to resolver_seco(ctx, m[k])
+    give salida
+
+-- Custom puro: se ejecuta de verdad en un mini-programa efímero.
+task ensayar_custom(ctx, cfg)
+    let lineas be ["require env(\"TELAR_*\")", "", "task nodo_custom(ctx, cfg)"]
+    each l in cfg["codigo"]
+        set lineas to append(lineas, "    " + l)
+    set lineas to append(lineas, "")
+    set lineas to append(lineas, "let ctx be json_decode(env(\"TELAR_CTX\", \"{}\"))")
+    set lineas to append(lineas, "print(json_encode(nodo_custom(ctx, {})))")
+    write_file("./flujos/.ensayo_custom.syn", join(lineas, "\n") + "\n")
+    let r be run("synsema", ["run", "./flujos/.ensayo_custom.syn"], 60, {"env": {"TELAR_CTX": json_encode(ctx)}})
+    when r["exit_code"] != 0
+        give {"ok": false, "error": trim(r["stdout"] + r["stderr"])}
+    give {"ok": true, "modo": "real", "salida": json_decode(trim(r["stdout"]))}
+
+task principal()
+    let grafo be json_decode(read_file("./compilador/grafos/" + FLUJO + ".json"))
+    let nodo be find_first(grafo["nodos"], (n) => n["id"] == NODO)
+    when nodo == nothing
+        give {"ok": false, "error": "el nodo '" + NODO + "' no existe en " + FLUJO}
+    let tipo be nodo["tipo"]
+    let cfg be nodo["config"]
+    db_open("./telar.db")
+
+    -- puros y lecturas: siempre de verdad
+    when tipo == "condicion"
+        give {"ok": true, "modo": "real", "salida": n_cond.evaluar(CTX, cfg)}
+    when tipo == "llm_decide"
+        give {"ok": true, "modo": "real", "salida": n_llm.decidir(CTX, cfg)}
+    when tipo == "sql_query"
+        give {"ok": true, "modo": "real", "salida": n_sql.consultar(CTX, cfg)}
+    when tipo == "custom"
+        let con_io be contains(cfg, "requires")
+        when not con_io
+            give ensayar_custom(CTX, cfg)
+        when MODO != "real"
+            give {"ok": true, "modo": "ensayo", "haria": {"accion": "custom con IO (" + join(cfg["requires"], ", ") + ") — ejecutalo en modo real para ver su salida", "codigo": cfg["codigo"]}}
+
+    -- con efectos: real solo si MODO == "real"
+    when MODO == "real"
+        when tipo == "sql_exec"
+            give {"ok": true, "modo": "real", "salida": n_sql.ejecutar(CTX, cfg)}
+        when tipo == "http"
+            give {"ok": true, "modo": "real", "salida": n_http.llamar(CTX, cfg)}
+        when tipo == "archivo"
+            give {"ok": true, "modo": "real", "salida": n_arch.escribir(CTX, cfg)}
+        when tipo == "custom"
+            give ensayar_custom(CTX, cfg)
+
+    when tipo == "sql_exec"
+        let params be when contains(cfg, "params") then lista_seca(CTX, cfg["params"]) otherwise []
+        give {"ok": true, "modo": "ensayo", "haria": {"accion": "ejecutar SQL", "stmt": cfg["stmt"], "params": params}}
+    when tipo == "http"
+        let headers be when contains(cfg, "headers") then map_seco(CTX, cfg["headers"]) otherwise {}
+        let cuerpo be when contains(cfg, "body") then map_seco(CTX, cfg["body"]) otherwise nothing
+        give {"ok": true, "modo": "ensayo", "haria": {"accion": "request HTTP", "metodo": when contains(cfg, "metodo") then cfg["metodo"] otherwise "POST", "url": cfg["url"], "headers": headers, "body": cuerpo}}
+    when tipo == "archivo"
+        give {"ok": true, "modo": "ensayo", "haria": {"accion": "escribir archivo", "path": cfg["path"], "modo_escritura": when contains(cfg, "modo") then cfg["modo"] otherwise "sobrescribir", "contenido": base.plantilla(CTX, text(resolver_seco(CTX, cfg["contenido"])))}}
+    give {"ok": false, "error": "tipo de nodo desconocido: " + tipo}
+
+try
+    print(json_encode(principal()))
+recover err
+    print(json_encode({"ok": false, "error": err}))

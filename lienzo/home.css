@@ -1,0 +1,73 @@
+/* Telar · home — espaciosa, una columna, el composer como protagonista. */
+
+.home {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 0 32px 70px;
+}
+
+.hero { text-align: center; padding-top: 8vh; margin-bottom: 44px; }
+.hero h1 { font-size: 42px; margin: 0 0 10px; letter-spacing: -.5px; }
+.hero > p { max-width: 520px; margin: 0 auto 26px; }
+
+.composer { text-align: left; padding: 10px 14px 12px; border-radius: 24px; }
+.composer textarea {
+  width: 100%;
+  border: 0;
+  background: none;
+  padding: 10px 8px 6px;
+  font-size: 15px;
+  min-height: 74px;
+  max-height: 320px;
+  resize: none;
+}
+.composer textarea:focus { outline: none; }
+.composer-pie { display: flex; align-items: center; gap: 14px; padding: 0 6px; }
+.ctx-toggle {
+  display: inline-flex; align-items: center; gap: 6px;
+  color: var(--mut); font-size: 12.5px; cursor: pointer;
+}
+.ctx-toggle input { accent-color: var(--cobre); }
+.hint { font-size: 11px; margin-left: auto; }
+.composer .btn { border-radius: 16px; }
+
+.tejiendo { padding: 12px 6px 4px; display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+
+.bloque { margin-bottom: 36px; }
+.bloque-cab { display: flex; align-items: baseline; gap: 12px; }
+.bloque h2 { font-size: 15px; margin: 0 0 6px; }
+.chica { font-size: 12.5px; margin: 2px 0 14px; }
+
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+#creds-alta { margin-top: 14px; max-width: 460px; }
+.cred-alta { display: flex; gap: 8px; }
+.cred-alta input { flex: 1; min-width: 0; }
+
+.grilla {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 18px;
+}
+.telar-card {
+  display: block;
+  padding: 18px;
+  text-decoration: none;
+  color: inherit;
+  transition: border-color .15s;
+}
+.telar-card:hover { border-color: var(--cobre); }
+.telar-card .nombre { font-weight: 650; margin-bottom: 6px; }
+.telar-card .meta { color: var(--mut); font-family: var(--mono); font-size: 11.5px; }
+.telar-card.ver-todos {
+  display: flex; align-items: center; justify-content: center;
+  color: var(--mut); border-style: dashed;
+}
+.telar-card.ver-todos:hover { color: var(--cobre); }
+
+@media (max-width: 780px) {
+  body { flex-direction: column; }
+  .sidebar { width: 100%; height: auto; position: static; flex-direction: row; align-items: center; gap: 10px; padding: 14px 18px; border-right: 0; border-bottom: 1px solid var(--linea); }
+  .sidebar nav { flex-direction: row; flex-wrap: wrap; }
+  .logo { margin-bottom: 0; }
+  .hero { padding-top: 6vh; }
+}

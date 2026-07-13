@@ -1,0 +1,144 @@
+-- Telar · worker — fase 4: el único que ejecuta flujos.
+--   Correr:  cd telar && synsema run worker.syn   (queda vivo en su loop)
+--
+-- Cada 2s: toma corridas pendientes de la cola (gateway/replay) y las ejecuta
+-- como proceso efímero (`synsema run flujos/<id>.syn`). Cada 10s: revisa los
+-- flujos con trigger "cron" ({"tipo": "cron", "cada_segundos": N}) y encola
+-- los que están vencidos.
+--
+-- Nota: el cron_every nativo de Synsema v0.4.6 no dispara (bug reportable);
+-- este loop explícito en modo `run` lo reemplaza — y funciona.
+
+intent: "Worker de Telar: ejecuta la cola de corridas y dispara los triggers cron"
+
+require db("./telar.db")
+require file
+require time
+require exec("synsema")
+
+db_open("./telar.db")
+sql_exec("CREATE TABLE IF NOT EXISTS cola (flujo TEXT, input TEXT, estado TEXT, created REAL, run_id TEXT, grupo TEXT)")
+sql_exec("CREATE TABLE IF NOT EXISTS cron_marcas (flujo TEXT PRIMARY KEY, ultima REAL)")
+try
+    sql_exec("ALTER TABLE cola ADD COLUMN grupo TEXT")
+recover e
+    print("(columna grupo ok)")
+sql_exec("CREATE TABLE IF NOT EXISTS charlas (flujo TEXT, grupo TEXT, rol TEXT, texto TEXT, created REAL)")
+
+use "./flujos/nodos/base.syn" as base
+
+-- Memoria conversacional: trigger.memoria = {"ventana": N, "texto_en": "path
+-- dentro de cada mensaje", "respuesta_de": "<id del nodo que responde>"}.
+task cargar_historial(fid, grupo, ventana)
+    let filas be sql("SELECT rol, texto FROM charlas WHERE flujo = ? AND grupo = ? ORDER BY created DESC LIMIT ?", [fid, grupo, ventana])
+    -- vienen del más nuevo al más viejo → los doy vuelta
+    let salida be []
+    each i in range(length(filas))
+        set salida to append(salida, filas[length(filas) - 1 - i])
+    give salida
+
+task guardar_turno(fid, grupo, rol, texto)
+    sql_exec("INSERT INTO charlas (flujo, grupo, rol, texto, created) VALUES (?, ?, ?, ?, ?)", [fid, grupo, rol, texto, now()])
+
+-- Si el flujo declara memoria.respuesta_de, la salida de ese nodo (que ya
+-- quedó en snapshots) se guarda como turno del bot en la charla.
+task recordar_respuesta(fid, grupo, rid)
+    try
+        when grupo != nothing
+            let gr be json_decode(read_file("./compilador/grafos/" + fid + ".json"))
+            when contains(gr["trigger"], "memoria")
+                when contains(gr["trigger"]["memoria"], "respuesta_de")
+                    let nodo be gr["trigger"]["memoria"]["respuesta_de"]
+                    let snaps be sql("SELECT ctx FROM snapshots WHERE run_id = ? AND nodo = ? ORDER BY created DESC LIMIT 1", [rid, nodo])
+                    when length(snaps) > 0
+                        guardar_turno(fid, grupo, "bot", text(json_decode(snaps[0]["ctx"])[nodo]))
+    recover e
+        log "⚠️ memoria (respuesta): " + e
+
+task procesar_cola()
+    each fila in sql("SELECT rowid AS cid, flujo, input, grupo FROM cola WHERE estado = 'pendiente' ORDER BY rowid LIMIT 5")
+        let rid be "w" + text(fila["cid"])
+        sql_exec("UPDATE cola SET estado = 'corriendo', run_id = ? WHERE rowid = ?", [rid, fila["cid"]])
+        log "▶ cola #" + text(fila["cid"]) + " → " + fila["flujo"] + " · " + rid
+        flush()
+        let res be run("synsema", ["run", "./flujos/" + fila["flujo"] + ".syn"], 120, {"env": {"TELAR_RUN_ID": rid, "TELAR_INPUT": fila["input"]}})
+        when res["exit_code"] == 0
+            sql_exec("UPDATE cola SET estado = 'ok' WHERE rowid = ?", [fila["cid"]])
+            recordar_respuesta(fila["flujo"], fila["grupo"], rid)
+            log "✅ " + rid + " ok"
+        otherwise
+            sql_exec("UPDATE cola SET estado = 'error' WHERE rowid = ?", [fila["cid"]])
+            sql_exec("UPDATE runs SET estado = 'error' WHERE id = ?", [rid])
+            log "❌ " + rid + " falló: " + slice(res["stdout"] + res["stderr"], 0, 200)
+        flush()
+
+-- Debounce de grupo: cuando un grupo (remitente) lleva N segundos sin mensajes
+-- nuevos, sus entregas 'esperando' se unen en UNA corrida:
+-- input = {"mensajes": [payload1, payload2, …], "grupo": clave}.
+task revisar_grupos()
+    each g in sql("SELECT flujo, grupo, MAX(created) AS ultimo FROM cola WHERE estado = 'esperando' GROUP BY flujo, grupo")
+        let silencio be 10
+        try
+            set silencio to json_decode(read_file("./compilador/grafos/" + g["flujo"] + ".json"))["trigger"]["agrupar"]["silencio_segundos"]
+        recover e
+            set silencio to 10
+        when now() - g["ultimo"] >= silencio
+            let filas be sql("SELECT rowid AS cid, input FROM cola WHERE estado = 'esperando' AND flujo = ? AND grupo = ? ORDER BY rowid", [g["flujo"], g["grupo"]])
+            let mensajes be apply((f) => json_decode(f["input"]), filas)
+            each f in filas
+                sql_exec("UPDATE cola SET estado = 'agrupada' WHERE rowid = ?", [f["cid"]])
+            let entrada be {"mensajes": mensajes, "grupo": g["grupo"]}
+            -- memoria: inyectar historial + guardar los turnos entrantes
+            try
+                let gr2 be json_decode(read_file("./compilador/grafos/" + g["flujo"] + ".json"))
+                when contains(gr2["trigger"], "memoria")
+                    let mem be gr2["trigger"]["memoria"]
+                    let ventana be when contains(mem, "ventana") then mem["ventana"] otherwise 16
+                    set entrada["historial"] to cargar_historial(g["flujo"], g["grupo"], ventana)
+                    each m in mensajes
+                        let texto be ""
+                        try
+                            set texto to text(base.ref({"m": m}, "m." + mem["texto_en"]))
+                        recover e2
+                            set texto to json_encode(m)
+                        guardar_turno(g["flujo"], g["grupo"], "cliente", texto)
+            recover e
+                log "⚠️ memoria: " + e
+            sql_exec("INSERT INTO cola (flujo, input, estado, created, grupo) VALUES (?, ?, 'pendiente', ?, ?)", [g["flujo"], json_encode(entrada), now(), g["grupo"]])
+            log "🫧 grupo '" + g["grupo"] + "': " + text(length(filas)) + " mensaje(s) unidos → " + g["flujo"]
+            flush()
+
+task revisar_crons()
+    each e in list_dir("./compilador/grafos")
+        when ends_with(e["name"], ".json")
+            let g be json_decode(read_file("./compilador/grafos/" + e["name"]))
+            let archivado be when contains(g, "archivado") then g["archivado"] otherwise false
+            when archivado != true
+                when g["trigger"]["tipo"] == "cron"
+                    let cada be g["trigger"]["cada_segundos"]
+                    let marcas be sql("SELECT ultima FROM cron_marcas WHERE flujo = ?", [g["id"]])
+                    let ultima be when length(marcas) > 0 then marcas[0]["ultima"] otherwise 0
+                    when now() - ultima >= cada
+                        let ejemplo be when contains(g["trigger"], "ejemplo") then json_encode(g["trigger"]["ejemplo"]) otherwise "{}"
+                        sql_exec("INSERT INTO cola (flujo, input, estado, created) VALUES (?, ?, 'pendiente', ?)", [g["id"], ejemplo, now()])
+                        when length(marcas) > 0
+                            sql_exec("UPDATE cron_marcas SET ultima = ? WHERE flujo = ?", [now(), g["id"]])
+                        otherwise
+                            sql_exec("INSERT INTO cron_marcas (flujo, ultima) VALUES (?, ?)", [g["id"], now()])
+                        log "⏰ cron vencido → encolado " + g["id"] + " (cada " + text(cada) + "s)"
+                        flush()
+
+print("🧵 Worker de Telar en marcha — cola cada 2s, crons cada 10s. Ctrl+C para frenar.")
+flush()
+let vuelta be 0
+while vuelta < 999999999
+    try
+        procesar_cola()
+        revisar_grupos()
+        when vuelta % 5 == 0
+            revisar_crons()
+    recover err
+        log "⚠️ worker: " + err
+        flush()
+    sleep(2)
+    set vuelta to vuelta + 1

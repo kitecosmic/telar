@@ -1,0 +1,36 @@
+-- Telar · setup — crea telar.db (runs, snapshots) + datos demo. Correr una vez:
+--   cd telar && synsema run setup.syn
+
+require db("./telar.db")
+require time
+
+db_open("./telar.db")
+sql_exec("CREATE TABLE IF NOT EXISTS runs (id TEXT, flujo TEXT, estado TEXT, created REAL)")
+sql_exec("CREATE TABLE IF NOT EXISTS snapshots (run_id TEXT, nodo TEXT, ctx TEXT, created REAL)")
+sql_exec("CREATE TABLE IF NOT EXISTS versiones (flujo TEXT, grafo TEXT, motivo TEXT, created REAL)")
+sql_exec("CREATE TABLE IF NOT EXISTS cola (flujo TEXT, input TEXT, estado TEXT, created REAL, run_id TEXT, grupo TEXT)")
+try
+    sql_exec("ALTER TABLE cola ADD COLUMN grupo TEXT")
+recover e
+    print("(columna grupo ya existe)")
+sql_exec("CREATE TABLE IF NOT EXISTS entregas (flujo TEXT, payload TEXT, created REAL)")
+sql_exec("CREATE TABLE IF NOT EXISTS cron_marcas (flujo TEXT PRIMARY KEY, ultima REAL)")
+sql_exec("CREATE TABLE IF NOT EXISTS charlas (flujo TEXT, grupo TEXT, rol TEXT, texto TEXT, created REAL)")
+
+-- tablas que usan los flujos de prueba
+sql_exec("CREATE TABLE IF NOT EXISTS ventas (producto TEXT, monto REAL, fecha TEXT)")
+sql_exec("CREATE TABLE IF NOT EXISTS pedidos (cliente TEXT, monto REAL, detalle TEXT, created REAL)")
+sql_exec("CREATE TABLE IF NOT EXISTS consultas (texto TEXT, categoria TEXT, created REAL)")
+
+-- semilla demo para resumen_ventas
+when length(sql("SELECT rowid FROM ventas")) == 0
+    sql_batch("INSERT INTO ventas (producto, monto, fecha) VALUES (?, ?, ?)", [
+        ["cemento", 45000, "2026-07-09"],
+        ["cemento", 30000, "2026-07-10"],
+        ["arena", 12500, "2026-07-10"],
+        ["hierro", 78000, "2026-07-11"],
+        ["arena", 8000, "2026-07-11"]
+    ])
+    print("ventas demo sembradas")
+
+print("telar.db listo")

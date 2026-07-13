@@ -1,0 +1,201 @@
+-- Telar · compilador/generar — el generador puro: grafo (map) → texto .syn.
+-- Módulo compartido por compilar.syn (CLI) y builder/builder.syn (agente).
+-- Tests:  cd telar && synsema test compilador/generar.syn
+
+let CATALOGO be {
+    "sql_query":  {"alias": "n_sql",  "archivo": "sql.syn",       "tarea": "consultar"},
+    "sql_exec":   {"alias": "n_sql",  "archivo": "sql.syn",       "tarea": "ejecutar"},
+    "http":       {"alias": "n_http", "archivo": "http.syn",      "tarea": "llamar"},
+    "condicion":  {"alias": "n_cond", "archivo": "condicion.syn", "tarea": "evaluar"},
+    "llm_decide": {"alias": "n_llm",  "archivo": "llm.syn",       "tarea": "decidir"},
+    "archivo":    {"alias": "n_arch", "archivo": "archivo.syn",   "tarea": "escribir"}
+}
+
+task escapar(t)
+    give replace_text(replace_text(t, "\\", "\\\\"), "\"", "\\\"")
+
+-- Emite un valor como literal Synsema. No usamos json_encode para inline de
+-- configs porque escapa los no-ASCII a \uXXXX (que Synsema no interpreta) y
+-- rompería acentos/emoji; además convierte nothing → null (inválido).
+task a_synsema(v)
+    let t be type_of(v)
+    when t == "text"
+        give "\"" + replace_text(escapar(v), "\n", "\\n") + "\""
+    when t == "number"
+        give text(v)
+    when t == "bool"
+        give when v then "true" otherwise "false"
+    when t == "nothing"
+        give "nothing"
+    when t == "list"
+        give "[" + join(apply((x) => a_synsema(x), v), ", ") + "]"
+    when t == "map"
+        give "{" + join(apply((k) => a_synsema(k) + ": " + a_synsema(v[k]), keys(v)), ", ") + "}"
+    raise("a_synsema: tipo no soportado en config: " + t)
+
+task host_de(url)
+    let g be capture(url, "https?://([^/:]+)")
+    when type_of(g) == "list"
+        give g[0]
+    give g
+
+task sin_clave(m, clave)
+    let salida be {}
+    each k in keys(m)
+        when k != clave
+            set salida[k] to m[k]
+    give salida
+
+-- Recorre un valor (configs anidadas) y junta los nombres de secretos
+-- referenciados con {"secret": "VAR"} o {"bearer": "VAR"}.
+export task secretos_en(v)
+    let hallados be []
+    when type_of(v) == "map"
+        each k in keys(v)
+            when k == "secret" or k == "bearer"
+                when type_of(v[k]) == "text"
+                    set hallados to append(hallados, v[k])
+            each h in secretos_en(v[k])
+                set hallados to append(hallados, h)
+    when type_of(v) == "list"
+        each item in v
+            each h in secretos_en(item)
+                set hallados to append(hallados, h)
+    give hallados
+
+export task generar(grafo)
+    let id be grafo["id"]
+
+    -- 1) unión de capabilities + módulos usados
+    let requiere be {}
+    let usos be {}
+    each nodo in grafo["nodos"]
+        let tipo be nodo["tipo"]
+        let cfg be nodo["config"]
+        when tipo == "http"
+            set requiere["require net(\"" + host_de(cfg["url"]) + "\")"] to true
+        when tipo == "llm_decide"
+            set requiere["require llm"] to true
+        when tipo == "archivo"
+            set requiere["require file(\"" + cfg["path"] + "\")"] to true
+        when tipo == "custom"
+            when contains(cfg, "requires")
+                each r in cfg["requires"]
+                    set requiere[r] to true
+        each s in secretos_en(cfg)
+            set requiere["require secret(\"" + s + "\")"] to true
+        when tipo != "custom"
+            when not contains(CATALOGO, tipo)
+                raise("tipo de nodo desconocido: '" + tipo + "' (nodo " + nodo["id"] + ")")
+            let info be CATALOGO[tipo]
+            set usos["use \"./nodos/" + info["archivo"] + "\" as " + info["alias"]] to true
+
+    -- 2) emitir el programa
+    let ejemplo be when contains(grafo["trigger"], "ejemplo") then json_encode(grafo["trigger"]["ejemplo"]) otherwise "{}"
+    let lineas be []
+    set lineas to append(lineas, "-- ⚙️ Generado por Telar desde compilador/grafos/" + id + ".json")
+    set lineas to append(lineas, "-- Editá el grafo y recompilá — no edites este archivo a mano.")
+    set lineas to append(lineas, "-- Correr:  cd telar && synsema run flujos/" + id + ".syn")
+    set lineas to append(lineas, "")
+    set lineas to append(lineas, "intent: \"" + grafo["nombre"] + "\"")
+    set lineas to append(lineas, "")
+    set lineas to append(lineas, "require env(\"TELAR_*\")")
+    set lineas to append(lineas, "require time")
+    set lineas to append(lineas, "require db(\"./telar.db\")")
+    each r in keys(requiere)
+        set lineas to append(lineas, r)
+    set lineas to append(lineas, "")
+    set lineas to append(lineas, "use \"./nodos/base.syn\" as base")
+    each u in keys(usos)
+        set lineas to append(lineas, u)
+    set lineas to append(lineas, "")
+    set lineas to append(lineas, "db_open(\"./telar.db\")")
+    set lineas to append(lineas, "")
+    set lineas to append(lineas, "let RUN be env(\"TELAR_RUN_ID\", \"dev\")")
+    set lineas to append(lineas, "let ctx be {}")
+    set lineas to append(lineas, "set ctx[\"trigger\"] to json_decode(env(\"TELAR_INPUT\", \"" + escapar(ejemplo) + "\"))")
+    set lineas to append(lineas, "")
+    set lineas to append(lineas, "task snapshot(run_id, nodo, ctx)")
+    set lineas to append(lineas, "    sql_exec(\"INSERT INTO snapshots (run_id, nodo, ctx, created) VALUES (?, ?, ?, ?)\", [run_id, nodo, json_encode(ctx), now()])")
+    set lineas to append(lineas, "")
+
+    -- 2a) los nodos custom se emiten como tasks propias (el 'Code node' de Telar)
+    each nodo in grafo["nodos"]
+        when nodo["tipo"] == "custom"
+            set lineas to append(lineas, "task nodo_custom_" + nodo["id"] + "(ctx, cfg)")
+            each linea in nodo["config"]["codigo"]
+                set lineas to append(lineas, "    " + linea)
+            set lineas to append(lineas, "")
+
+    set lineas to append(lineas, "sql_exec(\"INSERT INTO runs (id, flujo, estado, created) VALUES (?, ?, 'corriendo', ?)\", [RUN, \"" + id + "\", now()])")
+    set lineas to append(lineas, "")
+
+    -- 2b) el hilo del flujo: un set ctx[...] + snapshot por nodo
+    each nodo in grafo["nodos"]
+        let nid be nodo["id"]
+        let tipo be nodo["tipo"]
+        let llamada be ""
+        when tipo == "custom"
+            set llamada to "nodo_custom_" + nid + "(ctx, " + a_synsema(sin_clave(nodo["config"], "codigo")) + ")"
+        otherwise
+            let info be CATALOGO[tipo]
+            set llamada to info["alias"] + "." + info["tarea"] + "(ctx, " + a_synsema(nodo["config"]) + ")"
+        set lineas to append(lineas, "-- nodo " + nid + " (" + tipo + ")")
+        when contains(nodo, "solo_si")
+            set lineas to append(lineas, "when ctx[\"" + nodo["solo_si"] + "\"] == true")
+            set lineas to append(lineas, "    set ctx[\"" + nid + "\"] to " + llamada)
+            set lineas to append(lineas, "    snapshot(RUN, \"" + nid + "\", ctx)")
+        otherwise
+            set lineas to append(lineas, "set ctx[\"" + nid + "\"] to " + llamada)
+            set lineas to append(lineas, "snapshot(RUN, \"" + nid + "\", ctx)")
+        set lineas to append(lineas, "")
+
+    set lineas to append(lineas, "sql_exec(\"UPDATE runs SET estado = 'ok' WHERE id = ? AND flujo = ?\", [RUN, \"" + id + "\"])")
+    set lineas to append(lineas, "print(\"✅ flujo " + id + " · run \" + RUN + \" completado\")")
+    give join(lineas, "\n") + "\n"
+
+-- ── Tests (puros) ──
+test "generar emite intent, requires base y el hilo ctx"
+    let g be {"id": "t1", "nombre": "Prueba", "trigger": {"tipo": "manual"}, "nodos": [{"id": "c", "tipo": "condicion", "config": {"a": 1, "op": "==", "b": 1}}]}
+    let cod be generar(g)
+    assert(contains(cod, "intent: \"Prueba\""))
+    assert(contains(cod, "require db(\"./telar.db\")"))
+    assert(contains(cod, "set ctx[\"c\"] to n_cond.evaluar(ctx, "))
+    assert(contains(cod, "snapshot(RUN, \"c\", ctx)"))
+
+test "generar computa la unión de capabilities"
+    let g be {"id": "t2", "nombre": "P2", "trigger": {"tipo": "manual"}, "nodos": [{"id": "h", "tipo": "http", "config": {"url": "http://127.0.0.1:8080/x"}}, {"id": "cat", "tipo": "llm_decide", "config": {"pregunta": "q", "opciones": ["a"], "default": "a"}}]}
+    let cod be generar(g)
+    assert(contains(cod, "require net(\"127.0.0.1\")"))
+    assert(contains(cod, "require llm"))
+
+test "solo_si envuelve el nodo en un when"
+    let g be {"id": "t3", "nombre": "P3", "trigger": {"tipo": "manual"}, "nodos": [{"id": "c", "tipo": "condicion", "config": {"a": 1, "op": "==", "b": 1}}, {"id": "h", "tipo": "http", "config": {"url": "http://127.0.0.1:9/x"}, "solo_si": "c"}]}
+    let cod be generar(g)
+    assert(contains(cod, "when ctx[\"c\"] == true"))
+
+test "nodo custom se emite como task propia"
+    let g be {"id": "t4", "nombre": "P4", "trigger": {"tipo": "manual"}, "nodos": [{"id": "z", "tipo": "custom", "config": {"codigo": ["give 42"]}}]}
+    let cod be generar(g)
+    assert(contains(cod, "task nodo_custom_z(ctx, cfg)"))
+    assert(contains(cod, "    give 42"))
+    assert(contains(cod, "set ctx[\"z\"] to nodo_custom_z(ctx, {})"))
+
+test "tipo desconocido falla fuerte"
+    let g be {"id": "t5", "nombre": "P5", "trigger": {"tipo": "manual"}, "nodos": [{"id": "x", "tipo": "inexistente", "config": {}}]}
+    assert_error(() => generar(g))
+
+test "los secretos de las configs emiten require secret"
+    let g be {"id": "t6", "nombre": "P6", "trigger": {"tipo": "manual"}, "nodos": [{"id": "h", "tipo": "http", "config": {"url": "https://api.resend.com/emails", "headers": {"Authorization": {"bearer": "RESEND_API_KEY"}}, "body": {"to": "x@y.z"}}}]}
+    let cod be generar(g)
+    assert(contains(cod, "require secret(\"RESEND_API_KEY\")"))
+    assert(contains(cod, "require net(\"api.resend.com\")"))
+
+test "secretos_en encuentra secret y bearer anidados"
+    let s be secretos_en({"headers": {"apikey": {"secret": "EVOLUTION_API_KEY"}}, "otros": [{"bearer": "META_TOKEN"}]})
+    assert_eq(length(s), 2)
+
+test "a_synsema emite UTF-8 literal y nothing"
+    assert_eq(a_synsema("año — ⚠️"), "\"año — ⚠️\"")
+    assert_eq(a_synsema(nothing), "nothing")
+    assert_eq(a_synsema([1, "a"]), "[1, \"a\"]")

@@ -1,0 +1,163 @@
+-- Telar · gateway — fase 4: la superficie pública de webhooks.
+--   Correr:  cd telar && synsema serve gateway.syn   → :7002
+--
+-- URLs estables por flujo: POST /wh/<flujo>. Nunca se reinicia al recompilar
+-- flujos (no los lee al arrancar). Guarda cada entrega (replay disponible) y
+-- ENCOLA la corrida — el worker la ejecuta. Capabilities mínimas: serve+db+file.
+
+intent: "Gateway de Telar: recibe webhooks, guarda entregas y encola corridas"
+
+require serve(7002)
+require db("./telar.db")
+require file
+require time
+
+db_open("./telar.db")
+sql_exec("CREATE TABLE IF NOT EXISTS cola (flujo TEXT, input TEXT, estado TEXT, created REAL, run_id TEXT, grupo TEXT)")
+sql_exec("CREATE TABLE IF NOT EXISTS entregas (flujo TEXT, payload TEXT, created REAL)")
+try
+    sql_exec("ALTER TABLE cola ADD COLUMN grupo TEXT")
+recover e
+    log "columna grupo ok"
+
+use "./flujos/nodos/base.syn" as base
+
+task encolar(fid, payload)
+    let r be sql_exec("INSERT INTO cola (flujo, input, estado, created) VALUES (?, ?, 'pendiente', ?)", [fid, payload, now()])
+    give r["last_id"]
+
+-- Recepción unificada (webhook Y replay): respeta el debounce de grupo si el
+-- trigger lo declara — la entrega queda ESPERANDO y el worker la une tras el
+-- silencio; si no hay agrupar (o no se puede extraer la clave), encola directo.
+task recibir(fid, payload)
+    let grafo be json_decode(read_file("./compilador/grafos/" + fid + ".json"))
+    when contains(grafo["trigger"], "agrupar")
+        let ag be grafo["trigger"]["agrupar"]
+        let ref_por be when type_of(ag["por"]) == "map" then ag["por"]["ref"] otherwise ag["por"]
+        let clave be ""
+        try
+            set clave to text(base.ref({"trigger": json_decode(payload)}, ref_por))
+        recover e
+            set clave to ""
+        when clave != ""
+            sql_exec("INSERT INTO cola (flujo, input, estado, created, grupo) VALUES (?, ?, 'esperando', ?, ?)", [fid, payload, now(), clave])
+            log "🫧 " + fid + " · grupo '" + clave + "' esperando silencio"
+            give {"agrupado": true, "grupo": clave, "flujo": fid}
+        log "⚠️ " + fid + ": no pude extraer la clave de grupo — encolo directo"
+    let cid be encolar(fid, payload)
+    log "📨 → " + fid + " · cola #" + text(cid)
+    give {"encolado": cid, "flujo": fid}
+
+-- Lee una credencial del .env y la sella como secret (as_secret es puro:
+-- no necesita capability, y el valor queda opaco/redactado desde acá).
+task leer_secreto(nombre)
+    try
+        each linea in split(read_file("./.env"), "\n")
+            let m be capture(trim(linea), "^" + nombre + "=(.+)")
+            when m != nothing
+                let v be when type_of(m) == "list" then m[0] otherwise m
+                give as_secret(v, nombre)
+        give nothing
+    recover e
+        give nothing
+
+serve on 7002
+    rate_limit 120 per minute
+
+    describe
+        about: "Gateway de webhooks de Telar — POST /wh/<flujo> encola la corrida"
+        api: ["POST /wh/:flujo — recibir un webhook (body JSON = payload del trigger)", "GET /entregas/:flujo — últimas entregas", "POST /reenviar/:eid — re-encolar una entrega guardada", "GET /salud — estado y cola pendiente"]
+
+    route "GET /salud"
+        let pendientes be sql("SELECT COUNT(*) AS n FROM cola WHERE estado = 'pendiente'")
+        give {"service": "telar-gateway", "cola_pendiente": pendientes[0]["n"]}
+
+    -- Handshake de verificación estilo Meta/WhatsApp Cloud API: al dar de alta
+    -- el webhook, Meta hace un GET con hub.verify_token y hay que devolver
+    -- hub.challenge. El trigger declara "verificacion": {"secreto": "VAR"}.
+    route "GET /wh/:fid"
+        when not matches(params.fid, "[a-z0-9_]+")
+            give fail(400, "flujo inválido")
+        let ruta be "./compilador/grafos/" + params.fid + ".json"
+        when not file_exists(ruta)
+            give not_found("ese flujo no existe")
+        let grafo be json_decode(read_file(ruta))
+        when contains(grafo["trigger"], "verificacion")
+            when contains(query, "hub.verify_token")
+                let vt be leer_secreto(grafo["trigger"]["verificacion"]["secreto"])
+                when vt == nothing
+                    give fail(503, "la credencial de verificación no está en el .env")
+                when constant_time_eq(query["hub.verify_token"], vt)
+                    log "🤝 handshake verificado para " + params.fid
+                    give respond(query["hub.challenge"], "text/plain")
+                give fail(401, "verify_token inválido")
+        give {"flujo": params.fid, "uso": "POST acá con el payload JSON del trigger"}
+
+    route "POST /wh/:fid"
+        when not matches(params.fid, "[a-z0-9_]+")
+            give fail(400, "flujo inválido")
+        let ruta be "./compilador/grafos/" + params.fid + ".json"
+        when not file_exists(ruta)
+            give not_found("ese flujo no existe")
+        let grafo be json_decode(read_file(ruta))
+        let archivado be when contains(grafo, "archivado") then grafo["archivado"] otherwise false
+        when archivado == true
+            give not_found("ese flujo está archivado")
+        -- el body CRUDO, byte a byte: las firmas HMAC se calculan sobre eso
+        let payload be body of request
+        when trim(payload) == ""
+            set payload to "{}"
+        try
+            json_decode(payload)
+        recover err
+            give fail(422, "el body no es JSON válido")
+
+        -- Token simple en header, opcional (estilo Telegram:
+        -- X-Telegram-Bot-Api-Secret-Token). Comparación en tiempo constante.
+        -- trigger.header_secreto = {"header": "X-...", "secreto": "VAR"}
+        when contains(grafo["trigger"], "header_secreto")
+            let hs be grafo["trigger"]["header_secreto"]
+            let hdrs_t be headers of request
+            let hn be lower(hs["header"])
+            when not contains(hdrs_t, hn)
+                give fail(401, "falta el header " + hs["header"])
+            let sec_t be leer_secreto(hs["secreto"])
+            when sec_t == nothing
+                give fail(503, "la credencial " + hs["secreto"] + " no está en el .env")
+            when not constant_time_eq(hdrs_t[hn], sec_t)
+                log "⛔ " + params.fid + ": token de header inválido"
+                give fail(401, "token del header inválido")
+
+        -- Firma HMAC opcional por flujo (Stripe/GitHub/Meta/Shopify firman así):
+        -- trigger.firma = {"header": "X-Hub-Signature-256", "secreto": "VAR",
+        --                  "prefijo": "sha256=" (opcional), "algo": "sha256"|"sha512"}
+        when contains(grafo["trigger"], "firma")
+            let firma be grafo["trigger"]["firma"]
+            let hdrs be headers of request
+            let hname be lower(firma["header"])
+            when not contains(hdrs, hname)
+                log "⛔ " + params.fid + ": falta header de firma"
+                give fail(401, "falta el header de firma " + firma["header"])
+            let recibida be hdrs[hname]
+            when contains(firma, "prefijo")
+                set recibida to replace_text(recibida, firma["prefijo"], "")
+            let sec be leer_secreto(firma["secreto"])
+            when sec == nothing
+                give fail(503, "la credencial " + firma["secreto"] + " no está cargada en el .env")
+            let algo be when contains(firma, "algo") then firma["algo"] otherwise "sha256"
+            when not verify_hmac(payload, recibida, sec, algo)
+                log "⛔ " + params.fid + ": firma HMAC inválida"
+                give fail(401, "firma HMAC inválida")
+        sql_exec("INSERT INTO entregas (flujo, payload, created) VALUES (?, ?, ?)", [params.fid, payload, now()])
+        give created(recibir(params.fid, payload))
+
+    route "GET /entregas/:fid"
+        give sql("SELECT rowid AS eid, payload, created FROM entregas WHERE flujo = ? ORDER BY created DESC LIMIT 30", [params.fid])
+
+    -- Replay: re-encolar una entrega guardada tal cual llegó.
+    route "POST /reenviar/:eid"
+        let filas be sql("SELECT flujo, payload FROM entregas WHERE rowid = ?", [params.eid])
+        when length(filas) == 0
+            give not_found("esa entrega no existe")
+        log "🔁 replay entrega #" + params.eid
+        give created(recibir(filas[0]["flujo"], filas[0]["payload"]))

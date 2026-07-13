@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Telar — taller</title>
+<script>document.documentElement.dataset.tema = localStorage.getItem("telar-tema") || (matchMedia("(prefers-color-scheme: dark)").matches ? "oscuro" : "claro");</script>
+<link rel="stylesheet" href="/tema.css">
+<link rel="stylesheet" href="/taller.css">
+</head>
+<body>
+
+<aside class="sidebar">
+  <a class="logo" href="/"><span class="wordmark">Telar</span><span class="trama"></span></a>
+  <nav>
+    <a href="/" class="nav-item" data-pag="home">Inicio</a>
+    <a href="/taller" class="nav-item" data-pag="taller">Telares</a>
+    <a href="#credenciales" class="nav-item" data-pag="creds" id="nav-creds">Credenciales</a>
+    <a href="https://docs.synsema.com" target="_blank" rel="noopener" class="nav-item">Doc Synsema ↗</a>
+  </nav>
+  <span class="resorte"></span>
+  <button id="tema-toggle" class="tema-toggle" type="button"></button>
+</aside>
+
+<main class="taller">
+
+  <!-- Telares -->
+  <section class="panel carta flujos">
+    <h2>Telares</h2>
+    <input id="buscador" placeholder="filtrar…" autocomplete="off" spellcheck="false">
+    <div id="lista-flujos" class="lista-scroll"></div>
+    <div id="credenciales" class="creds-global">
+      <h2>Credenciales</h2>
+      <div id="creds-lista"></div>
+      <div id="creds-form"></div>
+    </div>
+  </section>
+
+  <!-- Grafo -->
+  <section class="panel carta lienzo-grafo">
+    <div id="grafo-vacio" class="vacio"><p>Elegí un telar a la izquierda,<br>o <a href="/">pedí uno nuevo</a>.</p></div>
+    <div id="grafo" hidden>
+      <div class="grafo-cab">
+        <h2 id="g-nombre"></h2>
+        <span id="g-trigger" class="chip"></span>
+        <button id="g-borrar" class="link-min peligro" type="button">borrar telar</button>
+      </div>
+      <div id="g-permisos" class="permisos"></div>
+      <div id="g-trigger-info" class="mut mono chica" hidden></div>
+
+      <div class="telar-chat">
+        <textarea id="f-chat" rows="2" spellcheck="false" placeholder="Charlá con este telar… preguntale por qué algo no funciona, o pedile un cambio (agregar una condición, otro nodo, lo que sea)."></textarea>
+        <div class="fila-botones">
+          <button id="f-preguntar" class="btn mini borde" type="button">💬 Preguntar</button>
+          <button id="f-pedir" class="btn mini" type="button">✂️ Pedir cambio</button>
+        </div>
+        <pre id="f-respuesta" class="salida" hidden></pre>
+      </div>
+
+      <div id="g-nodos" class="nodos"></div>
+    </div>
+  </section>
+
+  <!-- Detalle -->
+  <aside class="panel carta detalle">
+    <div id="d-probar" hidden>
+      <h2>Probar</h2>
+      <textarea id="probar-input" class="campo-mono" rows="6" spellcheck="false"></textarea>
+      <button id="probar-btn" class="btn mini" type="button">▶ Correr flujo</button>
+      <pre id="probar-out" class="salida" hidden></pre>
+    </div>
+
+    <div id="d-creds-flujo" hidden>
+      <h2>Credenciales del flujo</h2>
+      <div id="lista-creds"></div>
+    </div>
+
+    <div id="d-nodo" hidden>
+      <h2>Nodo <span id="n-id" class="mono"></span></h2>
+      <textarea id="n-config" class="campo-mono" rows="9" spellcheck="false"></textarea>
+      <div class="fila-botones">
+        <button id="n-guardar" class="btn mini" type="button">Guardar nodo</button>
+      </div>
+      <div class="nodo-chat">
+        <textarea id="n-chat" rows="2" spellcheck="false" placeholder="Pedile un cambio a este nodo… ej: mi instancia se llama instancia-joel"></textarea>
+        <button id="n-pedir" class="btn mini borde" type="button">Pedir cambio ✂️</button>
+      </div>
+      <div id="n-ensayo">
+        <h2>Ensayar este nodo</h2>
+        <p class="mut chica">Entrada (ctx) para el nodo — precargada con la última corrida. Ensayar es seguro: los nodos con efectos solo muestran qué harían.</p>
+        <textarea id="e-ctx" class="campo-mono" rows="6" spellcheck="false"></textarea>
+        <div class="fila-botones">
+          <button id="e-ensayar" class="btn mini" type="button">🧪 Ensayar</button>
+          <button id="e-real" class="btn mini borde" type="button">⚡ Ejecutar real</button>
+        </div>
+        <pre id="e-out" class="salida" hidden></pre>
+      </div>
+      <h2>Código compilado (.syn)</h2>
+      <pre id="n-fuente" class="salida"></pre>
+    </div>
+
+    <h2>Corridas</h2>
+    <div id="lista-runs"><p class="mut">—</p></div>
+
+    <div id="d-versiones" hidden>
+      <h2>Versiones</h2>
+      <div id="lista-versiones"></div>
+    </div>
+    <div id="d-snapshots" hidden>
+      <h2>Snapshots · <span id="s-run" class="mono"></span></h2>
+      <div id="lista-snaps"></div>
+    </div>
+  </aside>
+
+</main>
+
+<script type="module" src="/taller.js"></script>
+</body>
+</html>

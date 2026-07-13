@@ -1,0 +1,22 @@
+-- Telar · compilador — CLI fase 1: compila todos los grafos y los valida.
+--   Correr:  cd telar && synsema run compilar.syn
+-- El generador vive en generar.syn (compartido con builder/builder.syn).
+
+intent: "Compilador de Telar: convierte grafos de nodos en programas Synsema verificados"
+
+require file
+require exec("synsema")
+
+use "./compilador/generar.syn" as gen
+
+each e in list_dir("./compilador/grafos")
+    when ends_with(e["name"], ".json")
+        let grafo be json_decode(read_file("./compilador/grafos/" + e["name"]))
+        let destino be "./flujos/" + grafo["id"] + ".syn"
+        write_file(destino, gen.generar(grafo))
+        let chk be run("synsema", ["check", destino])
+        when chk["exit_code"] == 0
+            print("✅ " + destino + "  (" + trim(chk["stdout"]) + ")")
+        otherwise
+            print("❌ " + destino + " NO compila:")
+            print(chk["stdout"] + chk["stderr"])

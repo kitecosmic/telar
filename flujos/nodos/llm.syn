@@ -1,0 +1,32 @@
+-- Telar · nodos/llm — decisión con IA que degrada honesto: sin provider (o si
+-- la llamada falla) devuelve cfg["default"], nunca rompe el flujo.
+-- La capability `llm` la declara el flujo compilado.
+-- Tests:  synsema test llm.syn  (no requieren provider)
+
+use "./base.syn" as base
+
+export task decidir(ctx, cfg)
+    when llm_available()
+        try
+            -- acepta "texto con {refs}" plano o envuelto en {"tpl"/"ref"/"val"}
+            let pregunta be base.plantilla(ctx, text(base.resolver(ctx, cfg["pregunta"])))
+            let opciones be join(cfg["opciones"], " | ")
+            let r be reason about `{pregunta}
+Respondé ÚNICAMENTE con una de estas opciones, sin explicación ni nada más: {opciones}`
+            let limpio be fold(trim(r))
+            each o in cfg["opciones"]
+                when contains(limpio, fold(o))
+                    give o
+            log "nodo llm: la respuesta no matcheó ninguna opción, uso default"
+        recover err
+            log "nodo llm falló, uso default: " + err
+    give cfg["default"]
+
+test "sin provider devuelve el default"
+    when not llm_available()
+        assert_eq(decidir({}, {"pregunta": "da igual", "opciones": ["a", "b"], "default": "b"}), "b")
+
+test "con provider devuelve una opción válida"
+    when llm_available()
+        let r be decidir({"t": {"x": "no me llegó la factura"}}, {"pregunta": "Clasificá: {t.x}", "opciones": ["ventas", "facturacion", "otro"], "default": "otro"})
+        assert(contains(["ventas", "facturacion", "otro"], r))

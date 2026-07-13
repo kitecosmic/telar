@@ -1,0 +1,281 @@
+-- Telar · lienzo — fase 3: la UI. Grafo read-only + pedir al builder + probar
+-- flujos + historial de corridas con snapshots por nodo.
+--   Correr:  cd telar && synsema serve lienzo.syn   → http://127.0.0.1:7000
+--   (el builder tiene que estar corriendo aparte:  synsema serve builder.syn)
+--
+-- El lienzo NO edita flujos: se manipula pidiéndole al builder (manifiesto).
+-- v1: también dispara corridas (el worker dedicado llega en fase 4).
+
+intent: "Lienzo de Telar: ver flujos como grafo, pedir automatizaciones y mirar corridas"
+
+require serve(7000)
+require db("./telar.db")
+require file
+require net("127.0.0.1")
+require exec("synsema")
+require time
+
+db_open("./telar.db")
+sql_exec("CREATE TABLE IF NOT EXISTS versiones (flujo TEXT, grafo TEXT, motivo TEXT, created REAL)")
+
+use "./compilador/generar.syn" as gen
+
+task guardar_version(fid, motivo)
+    try
+        let ruta be "./compilador/grafos/" + fid + ".json"
+        when file_exists(ruta)
+            sql_exec("INSERT INTO versiones (flujo, grafo, motivo, created) VALUES (?, ?, ?, ?)", [fid, read_file(ruta), slice(motivo, 0, 140), now()])
+    recover e
+        log "⚠️ no pude guardar versión: " + e
+
+task nodo_con_config(n, cfg)
+    let salida be {}
+    each k in keys(n)
+        set salida[k] to n[k]
+    set salida["config"] to cfg
+    give salida
+
+serve on 7000
+    static "./lienzo"
+
+    -- Páginas: "/" la sirve static (index.html = home); el taller tiene ruta propia.
+    route "GET /taller"
+        give html(read_file("./lienzo/taller.html"))
+
+    describe
+        about: "Lienzo de Telar — automatizaciones que se piden a la IA"
+        api: ["GET /api/flujos — todos los grafos", "POST /api/pedir — construir un flujo desde lenguaje natural {pedido}", "POST /api/correr/:id — ejecutar un flujo (body = payload del trigger)", "GET /api/runs — últimas corridas", "GET /api/runs/:rid/snapshots — ctx por nodo de una corrida"]
+
+    route "GET /api/flujos"
+        let flujos be []
+        each e in list_dir("./compilador/grafos")
+            when ends_with(e["name"], ".json")
+                let g be json_decode(read_file("./compilador/grafos/" + e["name"]))
+                let archivado be when contains(g, "archivado") then g["archivado"] otherwise false
+                when archivado != true
+                    set flujos to append(flujos, g)
+        give flujos
+
+    -- Borrado (suave): guarda la versión y lo archiva — recuperable restaurando.
+    route "DELETE /api/flujos/:fid"
+        when not matches(params.fid, "[a-z0-9_]+")
+            give fail(400, "id de flujo inválido")
+        let ruta be "./compilador/grafos/" + params.fid + ".json"
+        when not file_exists(ruta)
+            give not_found("ese flujo no existe")
+        guardar_version(params.fid, "antes de borrar")
+        let grafo be json_decode(read_file(ruta))
+        set grafo["archivado"] to true
+        write_file(ruta, json_encode(grafo))
+        log "🗑 telar archivado: " + params.fid
+        give {"borrado": params.fid, "nota": "recuperable desde versiones"}
+
+    -- Historial de versiones de un flujo (motivo + fecha; el grafo queda en la base).
+    route "GET /api/flujos/:fid/versiones"
+        give sql("SELECT rowid AS vid, motivo, created FROM versiones WHERE flujo = ? ORDER BY created DESC LIMIT 30", [params.fid])
+
+    route "POST /api/flujos/:fid/restaurar/:vid"
+        when not matches(params.fid, "[a-z0-9_]+")
+            give fail(400, "id de flujo inválido")
+        let filas be sql("SELECT grafo FROM versiones WHERE rowid = ? AND flujo = ?", [params.vid, params.fid])
+        when length(filas) == 0
+            give not_found("esa versión no existe")
+        guardar_version(params.fid, "antes de restaurar la versión " + params.vid)
+        let grafo be json_decode(filas[0]["grafo"])
+        set grafo["id"] to params.fid
+        let codigo be gen.generar(grafo)
+        write_file("./compilador/grafos/" + params.fid + ".json", json_encode(grafo))
+        write_file("./flujos/" + params.fid + ".syn", codigo)
+        let chk be run("synsema", ["check", "./flujos/" + params.fid + ".syn"])
+        when chk["exit_code"] != 0
+            give fail(422, "esa versión ya no compila con los nodos actuales: " + chk["stdout"] + chk["stderr"])
+        log "⏪ " + params.fid + " restaurado a la versión " + params.vid
+        give {"ok": true, "restaurado": params.vid}
+
+    -- Chat del telar (flujo entero) y consultas — proxies al builder.
+    route "POST /api/flujos/:fid/pedir"
+        expect body {pedido: text}
+        let b be json of request
+        let forzar be when contains(b, "forzar") then b["forzar"] otherwise false
+        let r be http_post("http://127.0.0.1:7001/editar_flujo", json_encode({"flujo": params.fid, "pedido": b["pedido"], "forzar": forzar}), {"Content-Type": "application/json"}, 540)
+        when (status of r) >= 200
+            give respond(body of r, "application/json", status of r)
+        give fail(502, "builder no disponible")
+
+    route "POST /api/flujos/:fid/consultar"
+        expect body {pregunta: text}
+        let r be http_post("http://127.0.0.1:7001/consultar", json_encode({"flujo": params.fid, "pregunta": (json of request)["pregunta"]}), {"Content-Type": "application/json"}, 540)
+        when (status of r) >= 200
+            give respond(body of r, "application/json", status of r)
+        give fail(502, "builder no disponible")
+
+    -- El .syn compilado del flujo, para "ver el código" nodo por nodo.
+    route "GET /api/flujos/:fid/fuente"
+        when not matches(params.fid, "[a-z0-9_]+")
+            give fail(400, "id de flujo inválido")
+        when not file_exists("./flujos/" + params.fid + ".syn")
+            give not_found("ese flujo no existe")
+        give respond(read_file("./flujos/" + params.fid + ".syn"), "text/plain; charset=utf-8")
+
+    -- Edición manual del JSON de config de un nodo. Recompila y valida:
+    -- si no compila, restaura el flujo como estaba y devuelve el error.
+    route "POST /api/flujos/:fid/nodos/:nid"
+        expect body {config: map}
+        when not matches(params.fid, "[a-z0-9_]+")
+            give fail(400, "id de flujo inválido")
+        let ruta be "./compilador/grafos/" + params.fid + ".json"
+        when not file_exists(ruta)
+            give not_found("ese flujo no existe")
+        let original be read_file(ruta)
+        let grafo be json_decode(original)
+        when find_first(grafo["nodos"], (n) => n["id"] == params.nid) == nothing
+            give not_found("ese nodo no existe")
+        guardar_version(params.fid, "edición manual del nodo " + params.nid)
+        let cfg be (json of request)["config"]
+        set grafo["nodos"] to apply((n) => when n["id"] == params.nid then nodo_con_config(n, cfg) otherwise n, grafo["nodos"])
+        let codigo be gen.generar(grafo)
+        write_file(ruta, json_encode(grafo))
+        write_file("./flujos/" + params.fid + ".syn", codigo)
+        let chk be run("synsema", ["check", "./flujos/" + params.fid + ".syn"])
+        when chk["exit_code"] != 0
+            write_file(ruta, original)
+            write_file("./flujos/" + params.fid + ".syn", gen.generar(json_decode(original)))
+            give fail(422, "el cambio no compila (se restauró el flujo): " + chk["stdout"] + chk["stderr"])
+        log "✏️ nodo " + params.nid + " de " + params.fid + " editado a mano"
+        give {"ok": true, "nodo": params.nid}
+
+    -- Ensayar UN nodo con un ctx dado (fase 3.3). modo: "ensayo" (default,
+    -- efectos en seco) o "real" (opt-in). Nunca toca runs/snapshots.
+    route "POST /api/flujos/:fid/nodos/:nid/ensayar"
+        when not matches(params.fid, "[a-z0-9_]+")
+            give fail(400, "id de flujo inválido")
+        when not file_exists("./compilador/grafos/" + params.fid + ".json")
+            give not_found("ese flujo no existe")
+        let b be json of request
+        let modo be when contains(b, "modo") then b["modo"] otherwise "ensayo"
+        let ctx be when contains(b, "ctx") then b["ctx"] otherwise {}
+        log "🧪 ensayo nodo " + params.nid + " de " + params.fid + " (" + modo + ")"
+        let r be run("synsema", ["run", "./ensayar.syn"], 120, {"env": {"TELAR_FLUJO": params.fid, "TELAR_NODO": params.nid, "TELAR_MODO": modo, "TELAR_CTX": json_encode(ctx)}})
+        try
+            give json_decode(trim(r["stdout"]))
+        recover err
+            give fail(500, "el ensayo no devolvió JSON: " + slice(r["stdout"] + r["stderr"], 0, 400))
+
+    -- Chat por nodo: proxy al builder ("cambiá solo este nodo").
+    route "POST /api/flujos/:fid/nodos/:nid/pedir"
+        expect body {pedido: text}
+        let b be json of request
+        let forzar be when contains(b, "forzar") then b["forzar"] otherwise false
+        let r be http_post("http://127.0.0.1:7001/editar_nodo", json_encode({"flujo": params.fid, "nodo": params.nid, "pedido": b["pedido"], "forzar": forzar}), {"Content-Type": "application/json"}, 540)
+        when (status of r) >= 200
+            give respond(body of r, "application/json", status of r)
+        give fail(502, "builder no disponible")
+
+    route "GET /api/runs"
+        give sql("SELECT id, flujo, estado, created FROM runs ORDER BY created DESC LIMIT 100")
+
+    -- Eco local para probar integraciones sin depender de servicios externos:
+    -- devuelve los headers y el body tal como llegaron.
+    route "POST /api/echo"
+        give {"recibido": true, "headers": headers of request, "body": json of request}
+
+    -- ── Credenciales: Telar edita el .env por vos ──
+    -- Los flujos son procesos efímeros que releen el .env en cada corrida,
+    -- así que guardar acá alcanza — sin reiniciar nada.
+
+    -- Solo los NOMBRES (nunca los valores).
+    route "GET /api/credenciales"
+        let nombres be []
+        try
+            each linea in split(read_file("./.env"), "\n")
+                let m be capture(trim(linea), "^([A-Z][A-Z0-9_]*)=.+")
+                when m != nothing
+                    let nombre be when type_of(m) == "list" then m[0] otherwise m
+                    set nombres to append(nombres, {"nombre": nombre})
+        recover err
+            log "sin .env todavía"
+        give nombres
+
+    route "POST /api/credenciales"
+        expect body {nombre: text, valor: text}
+        let b be json of request
+        let nombre be trim(b["nombre"])
+        when not matches(nombre, "[A-Z][A-Z0-9_]*")
+            give fail(422, "nombre inválido: MAYUSCULAS_CON_GUIONES_BAJOS")
+        when length(trim(b["valor"])) == 0
+            give fail(422, "el valor está vacío")
+        let contenido be ""
+        try
+            set contenido to read_file("./.env")
+        recover err
+            set contenido to ""
+        -- reemplaza la línea si ya existe, si no la agrega al final
+        let lineas be []
+        let reemplazada be false
+        each linea in split(contenido, "\n")
+            when matches(trim(linea), nombre + "=.*")
+                set lineas to append(lineas, nombre + "=" + trim(b["valor"]))
+                set reemplazada to true
+            otherwise
+                set lineas to append(lineas, linea)
+        when not reemplazada
+            set lineas to append(lineas, nombre + "=" + trim(b["valor"]))
+        write_file("./.env", join(lineas, "\n"))
+        log "🔑 credencial guardada: " + nombre + " (valor redactado)"
+        give created({"guardada": nombre})
+
+    route "DELETE /api/credenciales/:nombre"
+        when not matches(params.nombre, "[A-Z][A-Z0-9_]*")
+            give fail(422, "nombre inválido")
+        let contenido be ""
+        try
+            set contenido to read_file("./.env")
+        recover err
+            give not_found("no hay credenciales guardadas")
+        let lineas be []
+        let habia be false
+        each linea in split(contenido, "\n")
+            when matches(trim(linea), params.nombre + "=.*")
+                set habia to true
+            otherwise
+                set lineas to append(lineas, linea)
+        when not habia
+            give not_found("esa credencial no existe")
+        write_file("./.env", join(lineas, "\n"))
+        log "🗑 credencial borrada: " + params.nombre
+        give {"borrada": params.nombre}
+
+    route "GET /api/runs/:rid/snapshots"
+        give sql("SELECT nodo, ctx, created FROM snapshots WHERE run_id = ? ORDER BY created", [params.rid])
+
+    -- Proxy al builder: la UI habla con un solo origen.
+    route "POST /api/pedir"
+        expect body {pedido: text}
+        log "📥 pedido → builder: " + (json of request)["pedido"]
+        let b be json of request
+        let con_ctx be when contains(b, "contexto") then b["contexto"] otherwise true
+        let forzar be when contains(b, "forzar") then b["forzar"] otherwise false
+        let r be http_post("http://127.0.0.1:7001/pedir", json_encode({"pedido": b["pedido"], "contexto": con_ctx, "forzar": forzar}), {"Content-Type": "application/json"}, 540)
+        -- passthrough: la respuesta del builder (incluidos sus 4xx, como el
+        -- guardián de credenciales) llega intacta; 502 solo si no respondió.
+        when (status of r) >= 200
+            give respond(body of r, "application/json", status of r)
+        give fail(502, "builder no disponible — ¿está corriendo `synsema serve builder.syn`?")
+
+    -- Ejecuta un flujo como proceso efímero (rol del worker, v1 acá).
+    route "POST /api/correr/:fid"
+        when not matches(params.fid, "[a-z0-9_]+")
+            give fail(400, "id de flujo inválido")
+        when not file_exists("./flujos/" + params.fid + ".syn")
+            give not_found("ese flujo no existe")
+        let entrada be trim(body of request)
+        when entrada == ""
+            set entrada to "{}"
+        try
+            json_decode(entrada)
+        recover err
+            give fail(422, "el payload del trigger no es JSON válido: " + err)
+        let rid be "r" + text(round(now()))
+        log "▶ corriendo " + params.fid + " · " + rid
+        let res be run("synsema", ["run", "./flujos/" + params.fid + ".syn"], 120, {"env": {"TELAR_RUN_ID": rid, "TELAR_INPUT": entrada}})
+        give {"run_id": rid, "exit": res["exit_code"], "stdout": res["stdout"], "stderr": res["stderr"]}

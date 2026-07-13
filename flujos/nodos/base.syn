@@ -1,0 +1,77 @@
+-- Telar · nodos/base — resolución de referencias entre nodos.
+-- Contrato: en la config de un nodo, un valor puede ser
+--   {"ref": "nodo.campo"}   → se resuelve contra ctx (path con puntos)
+--   {"tpl": "hola {n.x}"}   → plantilla con refs interpoladas
+--   {"val": <literal>}      → literal explícito (por si el literal es un map)
+--   cualquier otra cosa     → literal tal cual
+-- Tests:  synsema test base.syn
+
+export task ref(ctx, path)
+    let cur be ctx
+    each parte in split(path, ".")
+        when type_of(cur) == "list"
+            set cur to cur[round(number(parte))]
+        otherwise
+            set cur to cur[parte]
+    give cur
+
+export task plantilla(ctx, tpl)
+    let salida be tpl
+    each r in find_all(tpl, "[{][a-zA-Z0-9_.]+[}]")
+        let path be slice(r, 1, length(r) - 1)
+        set salida to replace_text(salida, r, text(ref(ctx, path)))
+    give salida
+
+-- OJO: `and` no cortocircuita en v0.4.6 — por eso los when van anidados.
+-- {"secret": "VAR"} → el valor crudo del secreto (ej: header apikey de Evolution).
+-- {"bearer": "VAR"} → "Bearer <secreto>" (Authorization). Ambos se leen del .env,
+-- se redactan en logs, y el flujo compilado declara `require secret("VAR")`.
+export task resolver(ctx, item)
+    when type_of(item) == "map"
+        when contains(item, "ref")
+            give ref(ctx, item["ref"])
+        when contains(item, "tpl")
+            give plantilla(ctx, item["tpl"])
+        when contains(item, "secret")
+            give secret(item["secret"])
+        when contains(item, "bearer")
+            give bearer(secret(item["bearer"]))
+        when contains(item, "val")
+            give item["val"]
+    give item
+
+export task resolver_lista(ctx, items)
+    give apply((x) => resolver(ctx, x), items)
+
+export task resolver_map(ctx, m)
+    let salida be {}
+    each k in keys(m)
+        set salida[k] to resolver(ctx, m[k])
+    give salida
+
+test "ref camina paths anidados"
+    let ctx be {"trigger": {"monto": 63000, "cliente": "joel"}}
+    assert_eq(ref(ctx, "trigger.monto"), 63000)
+    assert_eq(ref(ctx, "trigger.cliente"), "joel")
+
+test "ref indexa listas con índice numérico"
+    let ctx be {"filas": [{"total": 7}, {"total": 9}]}
+    assert_eq(ref(ctx, "filas.0.total"), 7)
+    assert_eq(ref(ctx, "filas.1.total"), 9)
+
+test "resolver distingue ref, tpl, val y literal"
+    let ctx be {"a": {"b": 5}}
+    assert_eq(resolver(ctx, {"ref": "a.b"}), 5)
+    assert_eq(resolver(ctx, {"tpl": "vale {a.b}!"}), "vale 5!")
+    assert_eq(resolver(ctx, {"val": 9}), 9)
+    assert_eq(resolver(ctx, "literal"), "literal")
+    assert_eq(resolver(ctx, 42), 42)
+
+test "resolver_map y resolver_lista resuelven en profundidad 1"
+    let ctx be {"n": {"x": "hola"}}
+    let m be resolver_map(ctx, {"a": {"ref": "n.x"}, "b": 2})
+    assert_eq(m["a"], "hola")
+    assert_eq(m["b"], 2)
+    let l be resolver_lista(ctx, [{"ref": "n.x"}, 7])
+    assert_eq(l[0], "hola")
+    assert_eq(l[1], 7)

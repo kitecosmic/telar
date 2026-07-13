@@ -1,0 +1,14 @@
+-- Telar · nodos/archivo — escribe un archivo con contenido templado.
+-- La capability `file(path)` la declara el flujo compilado.
+
+use "./base.syn" as base
+
+export task escribir(ctx, cfg)
+    -- acepta "texto con {refs}" plano o envuelto en {"tpl"/"ref"/"val"}
+    let contenido be base.plantilla(ctx, text(base.resolver(ctx, cfg["contenido"])))
+    when contains(cfg, "modo")
+        when cfg["modo"] == "append"
+            append_file(cfg["path"], contenido + "\n")
+            give cfg["path"]
+    write_file(cfg["path"], contenido)
+    give cfg["path"]

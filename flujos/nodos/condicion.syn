@@ -1,0 +1,37 @@
+-- Telar · nodos/condicion — evalúa una comparación y da bool.
+-- Los nodos con "solo_si": "<id>" en el grafo se ejecutan solo si este dio true.
+-- Tests:  synsema test condicion.syn
+
+use "./base.syn" as base
+
+export task evaluar(ctx, cfg)
+    let a be base.resolver(ctx, cfg["a"])
+    let b be base.resolver(ctx, cfg["b"])
+    match cfg["op"]
+        is ">"
+            give a > b
+        is ">="
+            give a >= b
+        is "<"
+            give a < b
+        is "<="
+            give a <= b
+        is "=="
+            give a == b
+        is "!="
+            give a != b
+        is "contiene"
+            give contains(fold(text(a)), fold(text(b)))
+    raise("nodo condicion: operador desconocido '" + cfg["op"] + "'")
+
+test "compara con refs del ctx"
+    let ctx be {"trigger": {"monto": 63000}}
+    assert_eq(evaluar(ctx, {"a": {"ref": "trigger.monto"}, "op": ">", "b": 50000}), true)
+    assert_eq(evaluar(ctx, {"a": {"ref": "trigger.monto"}, "op": "<=", "b": 50000}), false)
+
+test "contiene es insensible a mayúsculas y acentos"
+    let ctx be {"t": {"x": "No me llegó la FACTURA"}}
+    assert_eq(evaluar(ctx, {"a": {"ref": "t.x"}, "op": "contiene", "b": "factura"}), true)
+
+test "operador desconocido falla fuerte"
+    assert_error(() => evaluar({}, {"a": 1, "op": "???", "b": 2}))

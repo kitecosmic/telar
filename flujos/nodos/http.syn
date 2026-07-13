@@ -1,0 +1,27 @@
+-- Telar · nodos/http — llamada HTTP con los gotchas de la v0.4.6 horneados:
+-- el body va con json_encode + Content-Type explícito, y la respuesta se
+-- parsea con json_decode(body) porque el cliente no trae la clave `json`.
+-- La capability `net(host)` la declara el flujo compilado.
+
+use "./base.syn" as base
+
+export task llamar(ctx, cfg)
+    let headers be when contains(cfg, "headers") then base.resolver_map(ctx, cfg["headers"]) otherwise {}
+    set headers["Content-Type"] to "application/json"
+    let metodo be when contains(cfg, "metodo") then cfg["metodo"] otherwise "POST"
+    let cuerpo be nothing
+    when contains(cfg, "body")
+        set cuerpo to json_encode(base.resolver_map(ctx, cfg["body"]))
+    let r be http(metodo, cfg["url"], headers, nothing, cuerpo, 15)
+    -- Fail-loud: si la API respondió error, el flujo CORTA (y el builder lo ve
+    -- en su corrida de prueba). Opt-out con "tolerar_error": true en la config.
+    when not (ok of r)
+        let tolerar be when contains(cfg, "tolerar_error") then cfg["tolerar_error"] otherwise false
+        when tolerar != true
+            raise("nodo http: " + cfg["url"] + " respondió " + text(status of r) + " — " + slice(body of r, 0, 300))
+    let datos be nothing
+    try
+        set datos to json_decode(body of r)
+    recover err
+        set datos to nothing
+    give {"status": status of r, "ok": ok of r, "body": body of r, "json": datos}

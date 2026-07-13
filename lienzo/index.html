@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Telar</title>
+<script>document.documentElement.dataset.tema = localStorage.getItem("telar-tema") || (matchMedia("(prefers-color-scheme: dark)").matches ? "oscuro" : "claro");</script>
+<link rel="stylesheet" href="/tema.css">
+<link rel="stylesheet" href="/home.css">
+</head>
+<body>
+
+<aside class="sidebar">
+  <a class="logo" href="/"><span class="wordmark">Telar</span><span class="trama"></span></a>
+  <nav>
+    <a href="/" class="nav-item" data-pag="home">Inicio</a>
+    <a href="/taller" class="nav-item" data-pag="taller">Telares</a>
+    <a href="/taller#credenciales" class="nav-item" data-pag="creds">Credenciales</a>
+    <a href="https://docs.synsema.com" target="_blank" rel="noopener" class="nav-item">Doc Synsema ↗</a>
+  </nav>
+  <span class="resorte"></span>
+  <button id="tema-toggle" class="tema-toggle" type="button"></button>
+</aside>
+
+<main class="home">
+  <section class="hero">
+    <h1 id="saludo">Hola</h1>
+    <p class="mut">Pedí una automatización en tus palabras. Podés pegar JSON de ejemplo,
+    el body de una API externa, lo que haga falta para explicarla.</p>
+
+    <div class="composer carta">
+      <textarea id="pedido" rows="3" spellcheck="false"
+        placeholder="Ej: cuando llegue un pedido por webhook, guardalo y si supera 50 mil avisame por WhatsApp…"></textarea>
+      <div class="composer-pie">
+        <label class="ctx-toggle" title="El builder consulta el esquema real de la base y tus credenciales antes de diseñar el flujo">
+          <input id="ctx-auto" type="checkbox" checked>
+          <span>Contexto automático</span>
+        </label>
+        <span class="mut hint">Enter envía · Shift+Enter salto</span>
+        <button id="enviar" class="btn" type="button" hidden>Tejer</button>
+      </div>
+      <div id="tejiendo" class="tejiendo" hidden>
+        <span class="trama ancha animada"></span>
+        <span class="mut" id="tejiendo-msg">El builder está diseñando y probando tu flujo…</span>
+      </div>
+    </div>
+  </section>
+
+  <section class="bloque">
+    <div class="bloque-cab">
+      <h2>Credenciales</h2>
+      <button id="cred-nueva" class="link-min" type="button">+ nueva</button>
+    </div>
+    <p class="mut chica">Se cargan una sola vez y sirven para todos los telares. El valor nunca pasa por la IA.</p>
+    <div id="creds-chips" class="chips"></div>
+    <div id="creds-alta" hidden></div>
+  </section>
+
+  <section class="bloque">
+    <h2>Tus telares</h2>
+    <div id="recientes" class="grilla"></div>
+  </section>
+</main>
+
+<script type="module" src="/home.js"></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+# Secretos / config local — nunca subir
+.env
+
+# Estado del runtime Synsema
+.synsema/
+
+# Base local (corridas, snapshots, versiones, cola)
+telar.db
+
+# Salidas de los flujos demo
+avisos/
+informe_ventas.txt
+conteo_pedidos.txt
+reporte_consultas.txt
+
+# Efímeros del ensayo de nodos
+flujos/.ensayo_custom.syn
+
+# Volcados de depuración del builder
+depurar_respuesta_*.txt
+
+# Tus telares son TUS datos, no parte de la plataforma — los genera la app.
+# (el borrado desde la UI es archivado:true; el archivo queda en disco igual)
+# flujos/nodos/ NO entra acá: es el catálogo de nodos, código de la plataforma.
+compilador/grafos/
+flujos/*.syn

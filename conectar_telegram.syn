@@ -1,0 +1,33 @@
+-- Telar · conectar_telegram — registra tu bot de Telegram contra el gateway.
+--   Antes: cargá en el panel Credenciales (o .env):
+--     TELEGRAM_BOT_TOKEN   (te lo da @BotFather)
+--     TELEGRAM_WH_SECRET   (inventalo vos: un string random largo)
+--   Después, con el túnel corriendo (cloudflared tunnel --url http://127.0.0.1:7002):
+--     TUNNEL_URL=https://tu-tunel.trycloudflare.com synsema run conectar_telegram.syn
+--
+-- Nota: Telegram lleva el token en la URL (diseño de ellos, no nuestro) — por
+-- eso acá se usa env() y no secret(). No se imprime nunca.
+
+intent: "Registrar el webhook de un bot de Telegram apuntando al gateway de Telar"
+
+require env
+require net("api.telegram.org")
+
+task principal()
+    let token be env("TELEGRAM_BOT_TOKEN", "")
+    let secreto be env("TELEGRAM_WH_SECRET", "")
+    let tunel be env("TUNNEL_URL", "")
+    when token == ""
+        give "Falta TELEGRAM_BOT_TOKEN — cargalo en el panel Credenciales (te lo da @BotFather)."
+    when secreto == ""
+        give "Falta TELEGRAM_WH_SECRET — inventá un string random largo y cargalo en Credenciales."
+    when tunel == ""
+        give "Falta TUNNEL_URL — corré:  cloudflared tunnel --url http://127.0.0.1:7002  y pasá la URL:  TUNNEL_URL=https://… synsema run conectar_telegram.syn"
+    let destino be tunel + "/wh/telegram_bot"
+    let r be http_post("https://api.telegram.org/bot" + token + "/setWebhook", json_encode({"url": destino, "secret_token": secreto, "allowed_updates": ["message"]}), {"Content-Type": "application/json"})
+    when not (ok of r)
+        give "setWebhook falló (" + text(status of r) + "): " + slice(body of r, 0, 300)
+    let info be http_get("https://api.telegram.org/bot" + token + "/getWebhookInfo")
+    give "✅ Webhook registrado → " + destino + "\nEstado según Telegram: " + slice(body of info, 0, 400) + "\n\nEscribile a tu bot: 2-3 mensajes seguidos → una sola respuesta con IA."
+
+print(principal())

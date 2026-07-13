@@ -1,0 +1,418 @@
+-- Telar · builder — fase 2: del pedido en castellano al flujo compilado.
+--   Correr:  cd telar && synsema serve builder.syn
+--   Probar:  POST http://127.0.0.1:7001/pedir {"pedido": "cuando llegue X hacé Y"}
+--
+-- Bucle del agente: el LLM propone el grafo JSON → generar() lo compila →
+-- `synsema check` lo valida → si falla, el error vuelve al LLM (hasta 3
+-- intentos). Solo se persiste lo que compila. La respuesta incluye la
+-- superficie de permisos del flujo, para que el humano apruebe capacidades,
+-- no promesas.
+
+intent: "Builder de Telar: convierte pedidos en lenguaje natural en flujos Synsema verificados"
+
+require serve(7001)
+require llm
+require file
+require exec("synsema")
+require env
+require time
+require db("./telar.db")
+require net("docs.synsema.com")
+
+use "./compilador/generar.syn" as gen
+use "./builder/util.syn" as util
+use "./builder/mcp.syn" as mcp
+
+db_open("./telar.db")
+sql_exec("CREATE TABLE IF NOT EXISTS versiones (flujo TEXT, grafo TEXT, motivo TEXT, created REAL)")
+
+-- Versionado: antes de pisar un grafo, se guarda el anterior con su motivo.
+-- Si el LLM se equivoca, siempre se puede restaurar — nunca un loop de problemas.
+task guardar_version(fid, motivo)
+    try
+        let ruta be "./compilador/grafos/" + fid + ".json"
+        when file_exists(ruta)
+            sql_exec("INSERT INTO versiones (flujo, grafo, motivo, created) VALUES (?, ?, ?, ?)", [fid, read_file(ruta), slice(motivo, 0, 140), now()])
+    recover e
+        log "⚠️ no pude guardar versión de " + fid + ": " + e
+
+-- Contexto automático: el esquema REAL de la base, fresco en cada pedido,
+-- para que el LLM diseñe contra las tablas que existen (no las que imagina).
+task esquema_actual()
+    try
+        let tablas be sql("SELECT sql FROM sqlite_master WHERE type='table' AND name NOT IN ('runs','snapshots')")
+        give "\n\nEsquema REAL y actual de telar.db (usá estas tablas/columnas):\n" + join(apply((t) => t["sql"], tablas), "\n")
+    recover e
+        give ""
+
+-- La spec del DSL que ve el LLM (strings comunes: acá las llaves son inocuas).
+let SPEC be join([
+    "Sos el builder de Telar, una plataforma de automatizaciones. Convertís el pedido del usuario en un grafo de nodos JSON.",
+    "",
+    "Formato del grafo: {\"id\": \"snake_case\", \"nombre\": \"...\", \"trigger\": {...}, \"nodos\": [...]}",
+    "Trigger: {\"tipo\": \"webhook\" | \"manual\" | \"cron\", \"ejemplo\": {payload de prueba realista}}. Para tareas periódicas (\"cada 5 minutos...\") usá cron con \"cada_segundos\": N (ej 300); el worker lo dispara solo. Los webhook reciben en http://127.0.0.1:7002/wh/<id_flujo>. Protecciones OPCIONALES del webhook (solo si el emisor las usa; un webhook simple no lleva ninguna): \"firma\": {\"header\": \"X-Hub-Signature-256\", \"secreto\": \"VAR\", \"prefijo\": \"sha256=\"} para HMAC (Stripe/GitHub/Meta/Shopify); \"header_secreto\": {\"header\": \"X-Telegram-Bot-Api-Secret-Token\", \"secreto\": \"VAR\"} para token simple (Telegram); \"verificacion\": {\"secreto\": \"VAR\"} para el handshake GET de Meta/WhatsApp.",
+    "Mensajería (WhatsApp/Telegram/chat): si el usuario puede mandar varios mensajes seguidos, agregá al trigger \"agrupar\": {\"por\": {\"ref\": \"trigger.<path al id del remitente>\"}, \"silencio_segundos\": 10}. El flujo entonces recibe UN payload con forma {\"mensajes\": [los payloads originales en orden], \"grupo\": \"<remitente>\"} — armá el ejemplo del trigger con ESA forma y procesá la lista (ej. un nodo custom que junte los textos).",
+    "Memoria entre visitas (que el bot retome la charla aunque pasen horas): agregá al trigger \"memoria\": {\"ventana\": 16, \"texto_en\": \"<path del texto DENTRO de cada mensaje, ej message.text>\", \"respuesta_de\": \"<id del nodo cuya salida es la respuesta>\"}. El sistema inyecta trigger.historial = [{\"rol\": \"cliente\"|\"bot\", \"texto\": ...}] y guarda los turnos solo — el nodo que piensa debe incluir ese historial en su prompt. La memoria es AUTOMÁTICA: NO agregues nodos sql_query/sql_exec para leer ni guardar la charla (nada de tabla charlas) — el sistema ya lo hace.",
+    "Bots que conversan (la IA redacta la respuesta): el nodo que responde va como custom con \"requires\": [\"require llm\"] y redacción LIBRE, patrón de \"codigo\": armá el prompt en un let (incluyendo el historial si hay memoria y los mensajes nuevos), después [\"when llm_available()\", \"    give reason about prompt\", \"give \\\"texto de respaldo si no hay IA\\\"\"].",
+    "Cada nodo: {\"id\": \"snake_case\", \"tipo\": \"...\", \"config\": {...}} y opcionalmente \"solo_si\": \"<id de un nodo condicion>\" (el nodo corre solo si esa condicion dio true).",
+    "",
+    "En las configs, un valor puede ser: literal, {\"ref\": \"nodo.campo\"} (salida de un nodo anterior; el payload del trigger es \"trigger.campo\"), o {\"tpl\": \"texto con {nodo.campo} interpolado\"}.",
+    "",
+    "Tipos de nodo disponibles:",
+    "- sql_query  config: {\"query\": \"SELECT ...\", \"params\": [valores o refs]} → da lista de filas.",
+    "- sql_exec   config: {\"stmt\": \"INSERT/UPDATE ... con ?\", \"params\": [...]}. Para timestamp usá strftime('%s','now') en el SQL.",
+    "- http       config: {\"url\", \"metodo\" (default POST), \"headers\", \"body\"} → da {status, ok, json}. El body ya viaja como JSON. Sirve para CUALQUIER API externa: Evolution API, Meta/WhatsApp Cloud API, Telegram, mail por API HTTP (Resend/SendGrid/Brevo — NO hay SMTP), Sheets, etc. Usá la URL y el body reales de esa API.",
+    "- condicion  config: {\"a\", \"op\": \">\"|\">=\"|\"<\"|\"<=\"|\"==\"|\"!=\"|\"contiene\", \"b\"} → da true/false.",
+    "- llm_decide config: {\"pregunta\": tpl, \"opciones\": [textos], \"default\": texto} → da una de las opciones. Es un CLASIFICADOR: sirve para elegir entre categorías fijas (urgente/normal, sí/no), NUNCA para redactar la respuesta de un bot.",
+    "- archivo    config: {\"path\": \"./x.txt\", \"contenido\": tpl, \"modo\": \"append\" opcional (agrega una línea al final — para logs y avisos)}.",
+    "- custom     config: {\"codigo\": [líneas de Synsema], \"requires\": [\"require ...\"] si toca IO}. Las líneas son el CUERPO de una task(ctx, cfg) ya declarada por el compilador: arrancá directo con let/when/each y terminá con give — NO declares task adentro ni definas funciones propias. La salida del nodo X está en ctx[\"X\"]. OJO: el código es SYNSEMA (let x be …, set x to …, when/otherwise, each m in lista, give resultado) — JAMÁS Python ni JavaScript: nada de =, for…:, def, métodos con punto (.get/.append), ni builtins inventados (no existen push, str_concat, call). Ejemplo VÁLIDO de \"codigo\": [\"let textos be apply((m) => m[\\\"message\\\"][\\\"text\\\"], ctx[\\\"trigger\\\"][\\\"mensajes\\\"])\", \"give join(textos, \\\" / \\\")\"]. Builtins seguros: apply(fn, lista), where(lista, fn), join(lista, sep), split, length, append(lista, x), contains, slice, text(x), json_encode, json_decode, now(). Clave opcional de un map: NO existe .get() — usá let x be when contains(m, \\\"k\\\") then m[\\\"k\\\"] otherwise valor_default. La IA se llama give reason about prompt (SIEMPRE con about). Si dudás de la sintaxis, consultá la doc con las herramientas de abajo y probá el código con run_synsema.",
+    "",
+    "Base de datos disponible (SQLite telar.db): ventas(producto, monto, fecha) · pedidos(cliente, monto, detalle, created) · consultas(texto, categoria, created).",
+    "Credenciales: NUNCA las escribas literales en el grafo. El VALOR de un header puede ser {\"bearer\": \"NOMBRE_VAR\"} o {\"secret\": \"NOMBRE_VAR\"}. Ejemplos EXACTOS: \"headers\": {\"Authorization\": {\"bearer\": \"META_WA_TOKEN\"}} arma Authorization: Bearer <valor>; \"headers\": {\"apikey\": {\"secret\": \"EVOLUTION_API_KEY\"}} manda el valor crudo. El sistema las lee del .env, las redacta en logs y el flujo declara require secret(). Van SOLO en headers — nunca en el body ni en la URL.",
+    "Si la API externa responde un error (status 4xx/5xx), el flujo corta ahí (fail-loud). Solo si el pedido dice explícitamente que un error no importa, agregá \"tolerar_error\": true a la config del nodo http.",
+    "Si el pedido dice avisar/notificar por un servicio concreto (WhatsApp, mail, Telegram…), usá http con la API real de ese servicio y credenciales por {\"bearer\"/\"secret\"} — aunque el usuario todavía no haya cargado la key. Solo si NO nombra ningún servicio, usá el buzón simple: nodo archivo en modo append a ./avisos/<destinatario>.txt.",
+    "",
+    "Los nodos se ejecutan en el orden del array. Usá la menor cantidad de nodos que resuelva el pedido.",
+    "sql_query da una LISTA de filas: indexá con {nodo.0.campo}. Toda ref \"trigger.X\" tiene que existir en trigger.ejemplo (poné en el ejemplo todos los campos que uses). Si necesitás fecha/hora actual, usá strftime en SQL o un nodo custom con now() y \"requires\": [\"require time\"].",
+    "",
+    "Herramientas de documentación (MCP de docs.synsema.com): antes de entregar el grafo podés consultar la doc oficial de Synsema. Para usar una, respondé ÚNICAMENTE {\"herramienta\": \"<nombre>\", \"args\": {...}} — te devuelvo el resultado y seguís. Disponibles:",
+    "- search_docs args {\"query\": \"palabras en inglés\"} → páginas que coinciden (slug y título).",
+    "- get_page args {\"slug\": \"10-syntax\"} → la página en Markdown. Claves: 10-syntax (let/set, operadores, strings, interpolación), 12-tasks-lambdas (task, give, lambdas, apply), 13-control-errors (when/otherwise, each, while, try/recover), 36-json (json_encode/json_decode).",
+    "- run_synsema args {\"code\": \"<programa Synsema completo>\"} → lo corre en un sandbox y devuelve el stdout o el error exacto. Probá ahí el código de tus nodos custom ANTES de entregar el grafo.",
+    "Usalas siempre que un nodo custom no sea trivial: una consulta cuesta menos que un grafo que no compila, y run_synsema te da el error exacto antes de entregar. Máximo 6 consultas por pedido.",
+    "",
+    "Respondé ÚNICAMENTE un JSON: o una herramienta {\"herramienta\": ...} o el grafo final, sin explicación ni markdown."
+], "\n")
+
+-- Ejemplo real como referencia de formato (few-shot barato): el primer grafo
+-- VIVO que haya (los archivados pueden ser justamente intentos fallidos).
+task ejemplo_grafo()
+    each e in list_dir("./compilador/grafos")
+        when ends_with(e["name"], ".json")
+            let txt be read_file("./compilador/grafos/" + e["name"])
+            let g be json_decode(txt)
+            let arch be when contains(g, "archivado") then g["archivado"] otherwise false
+            when arch != true
+                give txt
+    give "{}"
+
+let EJEMPLO be ejemplo_grafo()
+
+-- Nombres de credenciales ya cargadas (frescos del .env; nunca los valores).
+-- Se inyectan al prompt para que el LLM REUSE nombres en vez de inventar
+-- SHOPIFY_KEY / SHOPIFY_TOKEN / SHOPIFY_API_KEY para el mismo servicio.
+task nombres_credenciales()
+    let nombres be []
+    try
+        each linea in split(read_file("./.env"), "\n")
+            let m be capture(trim(linea), "^([A-Z][A-Z0-9_]*)=.+")
+            when m != nothing
+                let n be when type_of(m) == "list" then m[0] otherwise m
+                when not starts_with(n, "SYNSEMA_")
+                    set nombres to append(nombres, n)
+    recover e
+        give nombres
+    give nombres
+
+-- ¿Existe la credencial? Mira el proceso Y el archivo .env FRESCO — así una
+-- key guardada desde el lienzo cuenta sin reiniciar este servicio.
+task cred_existe(nombre)
+    when env(nombre, "") != ""
+        give true
+    try
+        give length(find_all(read_file("./.env"), "(?m)^" + nombre + "=.+")) > 0
+    recover e
+        give false
+
+-- reason about con herramientas: si el LLM responde {"herramienta": ..., "args":
+-- ...}, se llama al MCP de la doc, el resultado vuelve al prompt y se repregunta
+-- (máx 4 consultas). Así "busca cómo se hace" en vez de adivinar sintaxis.
+task preguntar(prompt)
+    let charla be prompt
+    let vuelta be 0
+    while vuelta < 7
+        let r be reason about charla
+        let tool be nothing
+        try
+            let j be util.extraer_json(r)
+            when type_of(j) == "map"
+                when contains(j, "herramienta")
+                    set tool to j
+        recover e
+            set tool to nothing
+        when tool == nothing
+            give r
+        let nombre be text(tool["herramienta"])
+        let args be when contains(tool, "args") then tool["args"] otherwise {}
+        log "📚 doc-tool " + nombre + " " + slice(json_encode(args), 0, 100)
+        let doc be mcp.herramienta(nombre, args)
+        set charla to charla + "\n\n[Usaste la herramienta " + nombre + " con " + json_encode(args) + " — resultado:]\n" + slice(doc, 0, 6000) + "\n\n[Te quedan " + text(6 - vuelta) + " consultas. Si necesitás otra herramienta respondé SOLO ese JSON (si tu grafo lleva nodos custom, probá ese código con run_synsema antes de entregar); si ya tenés lo que hace falta, respondé el JSON pedido, sin nada más alrededor.]"
+        set vuelta to vuelta + 1
+    -- presupuesto agotado: última llamada, entrega obligada con lo aprendido
+    give reason about charla + "\n\n[SE ACABARON las consultas a herramientas. Respondé AHORA ÚNICAMENTE el JSON final pedido, con lo que ya aprendiste — sin herramientas, sin prosa.]"
+
+-- Saneos que no dependen del LLM: ejemplo coherente con la memoria (el worker
+-- inyecta trigger.historial en producción — la prueba necesita el campo) y
+-- custom sin tasks anidadas (el cuerpo ya ES una task; anidar deja el nodo mudo).
+task normalizar(grafo)
+    when contains(grafo["trigger"], "memoria")
+        when contains(grafo["trigger"], "ejemplo")
+            when not contains(grafo["trigger"]["ejemplo"], "historial")
+                let tr be grafo["trigger"]
+                let ej be tr["ejemplo"]
+                set ej["historial"] to []
+                set tr["ejemplo"] to ej
+                set grafo["trigger"] to tr
+    each n in grafo["nodos"]
+        when n["tipo"] == "custom"
+            when contains(n["config"], "codigo")
+                each l in n["config"]["codigo"]
+                    when starts_with(trim(l), "task ")
+                        raise("el nodo custom '" + text(n["id"]) + "' declara una task adentro de \"codigo\" — las líneas ya son el cuerpo de una task(ctx, cfg): escribí let/when/each/give directo, sin declarar tasks propias")
+    give grafo
+
+task construir(pedido, con_contexto = true)
+    let error_previo be ""
+    let intento be 1
+    while intento <= 3
+        let extra be ""
+        when error_previo != ""
+            set extra to "\n\nTu intento anterior falló con este error — corregilo y devolvé el JSON completo de nuevo:\n" + error_previo
+        let contexto be ""
+        when con_contexto
+            set contexto to esquema_actual()
+            let creds be nombres_credenciales()
+            when length(creds) > 0
+                set contexto to contexto + "\n\nCredenciales YA cargadas en el sistema — si el servicio coincide usá EXACTAMENTE ese nombre, no inventes uno nuevo: " + join(creds, ", ")
+        let prompt be SPEC + contexto + "\n\nEjemplo de grafo válido:\n" + EJEMPLO + "\n\nPedido del usuario: " + pedido + extra
+        let r be preguntar(prompt)
+        try
+            let grafo be normalizar(util.extraer_json(r))
+            let id be replace_re(lower(text(grafo["id"])), "[^a-z0-9_]", "_")
+            set grafo["id"] to id
+            let codigo be gen.generar(grafo)
+            when intento == 1
+                guardar_version(id, "sobrescrito por pedido nuevo: " + pedido)
+            write_file("./compilador/grafos/" + id + ".json", json_encode(grafo))
+            write_file("./flujos/" + id + ".syn", codigo)
+            let chk be run("synsema", ["check", "./flujos/" + id + ".syn"])
+            when chk["exit_code"] != 0
+                set error_previo to "El flujo no compila:\n" + chk["stdout"] + chk["stderr"]
+                log "⚠️ intento " + text(intento) + ": no compila, reintento con el error"
+            otherwise
+                -- Si el flujo usa credenciales que no están en el .env, no lo probamos:
+                -- lo entregamos pidiendo las variables (UX de "dame la key y listo").
+                let faltan be []
+                each s in gen.secretos_en(grafo)
+                    when not cred_existe(s)
+                        when not contains(faltan, s)
+                            set faltan to append(faltan, s)
+                when length(faltan) > 0
+                    log "🔑 flujo " + id + " construido — faltan credenciales: " + join(faltan, ", ")
+                    give {"ok": true, "id": id, "intentos": intento, "probado": false, "faltan_credenciales": faltan, "permisos": util.permisos_de(codigo), "archivo": "flujos/" + id + ".syn", "nota": "Agregá estas variables al .env de telar y probá el flujo desde el lienzo.", "grafo": grafo}
+                -- fase 2.1: correrlo DE VERDAD con el ejemplo del trigger.
+                -- El check no caza refs inválidas ni templates rotos; una corrida sí.
+                let ejemplo be when contains(grafo["trigger"], "ejemplo") then json_encode(grafo["trigger"]["ejemplo"]) otherwise "{}"
+                let prueba be run("synsema", ["run", "./flujos/" + id + ".syn"], 90, {"env": {"TELAR_RUN_ID": "tj_" + id + "_" + text(intento), "TELAR_INPUT": ejemplo}})
+                when prueba["exit_code"] == 0
+                    log "🧵 flujo " + id + " construido y probado en " + text(intento) + " intento(s)"
+                    give {"ok": true, "id": id, "intentos": intento, "probado": true, "permisos": util.permisos_de(codigo), "archivo": "flujos/" + id + ".syn", "salida_prueba": trim(prueba["stdout"]), "grafo": grafo}
+                set error_previo to "El flujo compila pero FALLÓ al ejecutarlo con el ejemplo del trigger:\n" + prueba["stdout"] + prueba["stderr"]
+                log "⚠️ intento " + text(intento) + ": falló en runtime, reintento con el error"
+        recover err
+            set error_previo to err
+            log "⚠️ intento " + text(intento) + ": " + err
+            try
+                let d be when length(r) > 400 then length(r) - 400 otherwise 0
+                log "🗒 fin de la respuesta cruda (" + text(length(r)) + " chars): …" + slice(r, d, length(r))
+                write_file("./depurar_respuesta_" + text(intento) + ".txt", r)
+            recover e2
+                log "🗒 (sin respuesta cruda para mostrar)"
+        set intento to intento + 1
+    give {"ok": false, "intentos": 3, "error": error_previo}
+
+-- Edita UN nodo de un flujo existente según un pedido en castellano.
+-- Mismo rigor que construir: el resultado debe compilar (si no, se restaura el
+-- flujo original). La corrida de prueba acá es INFORMATIVA: si falla (p.ej. el
+-- servicio externo está caído) el cambio se conserva y se devuelve la advertencia.
+task editar_nodo(fid, nid, pedido)
+    let ruta be "./compilador/grafos/" + fid + ".json"
+    let original be read_file(ruta)
+    let grafo be json_decode(original)
+    when find_first(grafo["nodos"], (n) => n["id"] == nid) == nothing
+        give {"ok": false, "error": "el nodo '" + nid + "' no existe en el flujo"}
+    guardar_version(fid, "chat del nodo " + nid + ": " + pedido)
+    let error_previo be ""
+    let intento be 1
+    while intento <= 3
+        let extra be ""
+        when error_previo != ""
+            set extra to "\n\nTu intento anterior falló con este error — corregilo y devolvé el JSON del nodo de nuevo:\n" + error_previo
+        let prompt be SPEC + "\n\nGrafo completo del flujo (solo contexto, NO lo devuelvas):\n" + json_encode(grafo) + "\n\nEditá ÚNICAMENTE el nodo \"" + nid + "\". Pedido del usuario sobre ese nodo: " + pedido + "\nRespondé SOLO el JSON de ese nodo (claves id, tipo, config y solo_si si corresponde), sin explicación ni markdown." + extra
+        let r be preguntar(prompt)
+        try
+            let nuevo be util.extraer_json(r)
+            set nuevo["id"] to nid
+            set grafo["nodos"] to apply((n) => when n["id"] == nid then nuevo otherwise n, grafo["nodos"])
+            set grafo to normalizar(grafo)
+            let codigo be gen.generar(grafo)
+            write_file(ruta, json_encode(grafo))
+            write_file("./flujos/" + fid + ".syn", codigo)
+            let chk be run("synsema", ["check", "./flujos/" + fid + ".syn"])
+            when chk["exit_code"] != 0
+                set error_previo to "no compila: " + chk["stdout"] + chk["stderr"]
+            otherwise
+                let faltan be []
+                each s in gen.secretos_en(grafo)
+                    when not cred_existe(s)
+                        when not contains(faltan, s)
+                            set faltan to append(faltan, s)
+                when length(faltan) > 0
+                    give {"ok": true, "id": fid, "nodo": nid, "intentos": intento, "probado": false, "faltan_credenciales": faltan, "grafo": grafo}
+                let ejemplo be when contains(grafo["trigger"], "ejemplo") then json_encode(grafo["trigger"]["ejemplo"]) otherwise "{}"
+                let prueba be run("synsema", ["run", "./flujos/" + fid + ".syn"], 90, {"env": {"TELAR_RUN_ID": "tj_edit_" + nid, "TELAR_INPUT": ejemplo}})
+                when prueba["exit_code"] == 0
+                    log "✂️ nodo " + nid + " de " + fid + " editado y probado"
+                    give {"ok": true, "id": fid, "nodo": nid, "intentos": intento, "probado": true, "permisos": util.permisos_de(codigo), "grafo": grafo}
+                log "✂️ nodo " + nid + " editado; la prueba falló (cambio conservado)"
+                give {"ok": true, "id": fid, "nodo": nid, "intentos": intento, "probado": false, "advertencia": "El nodo quedó editado y compila, pero la corrida de prueba falló (¿servicio externo caído?): " + slice(prueba["stdout"] + prueba["stderr"], 0, 400), "grafo": grafo}
+        recover err
+            set error_previo to err
+        set intento to intento + 1
+    -- nada compiló: restaurar el flujo original intacto
+    write_file(ruta, original)
+    write_file("./flujos/" + fid + ".syn", gen.generar(json_decode(original)))
+    give {"ok": false, "intentos": 3, "error": error_previo, "nota": "el flujo quedó como estaba"}
+
+-- Edita el FLUJO ENTERO según un pedido: puede agregar, quitar o modificar
+-- nodos y el trigger. La versión anterior queda guardada; si nada compila,
+-- se restaura el original.
+task editar_flujo(fid, pedido)
+    let ruta be "./compilador/grafos/" + fid + ".json"
+    let original be read_file(ruta)
+    guardar_version(fid, "chat del telar: " + pedido)
+    let error_previo be ""
+    let intento be 1
+    while intento <= 3
+        let extra be ""
+        when error_previo != ""
+            set extra to "\n\nTu intento anterior falló con este error — corregilo y devolvé el grafo completo de nuevo:\n" + error_previo
+        let contexto be esquema_actual()
+        let creds be nombres_credenciales()
+        when length(creds) > 0
+            set contexto to contexto + "\nCredenciales ya cargadas (usá exactamente esos nombres): " + join(creds, ", ")
+        let prompt be SPEC + contexto + "\n\nGrafo ACTUAL del flujo:\n" + original + "\n\nAplicá este cambio al flujo (podés agregar, quitar o modificar nodos y el trigger; mantené el mismo id \"" + fid + "\" y lo que no haga falta tocar): " + pedido + "\nRespondé ÚNICAMENTE el JSON del grafo COMPLETO corregido." + extra
+        let r be preguntar(prompt)
+        try
+            let grafo be normalizar(util.extraer_json(r))
+            set grafo["id"] to fid
+            let codigo be gen.generar(grafo)
+            write_file(ruta, json_encode(grafo))
+            write_file("./flujos/" + fid + ".syn", codigo)
+            let chk be run("synsema", ["check", "./flujos/" + fid + ".syn"])
+            when chk["exit_code"] != 0
+                set error_previo to "no compila: " + chk["stdout"] + chk["stderr"]
+            otherwise
+                let faltan be []
+                each s in gen.secretos_en(grafo)
+                    when not cred_existe(s)
+                        when not contains(faltan, s)
+                            set faltan to append(faltan, s)
+                when length(faltan) > 0
+                    give {"ok": true, "id": fid, "intentos": intento, "probado": false, "faltan_credenciales": faltan, "permisos": util.permisos_de(codigo), "grafo": grafo}
+                let ejemplo be when contains(grafo["trigger"], "ejemplo") then json_encode(grafo["trigger"]["ejemplo"]) otherwise "{}"
+                let prueba be run("synsema", ["run", "./flujos/" + fid + ".syn"], 90, {"env": {"TELAR_RUN_ID": "tj_flujo_" + fid, "TELAR_INPUT": ejemplo}})
+                when prueba["exit_code"] == 0
+                    log "🧵 flujo " + fid + " editado y probado"
+                    give {"ok": true, "id": fid, "intentos": intento, "probado": true, "permisos": util.permisos_de(codigo), "grafo": grafo}
+                give {"ok": true, "id": fid, "intentos": intento, "probado": false, "advertencia": "El flujo quedó editado y compila, pero la corrida de prueba falló: " + slice(prueba["stdout"] + prueba["stderr"], 0, 400), "grafo": grafo}
+        recover err
+            set error_previo to err
+        set intento to intento + 1
+    write_file(ruta, original)
+    write_file("./flujos/" + fid + ".syn", gen.generar(json_decode(original)))
+    give {"ok": false, "intentos": 3, "error": error_previo, "nota": "el flujo quedó como estaba"}
+
+-- Consulta SOBRE un flujo sin tocarlo: el LLM responde con el grafo, el código
+-- compilado y la última corrida (snapshots) como contexto — ideal para
+-- "¿por qué no me funciona?" antes de pedir un cambio.
+task consultar(fid, pregunta)
+    let grafo_txt be read_file("./compilador/grafos/" + fid + ".json")
+    let codigo be read_file("./flujos/" + fid + ".syn")
+    let corrida be ""
+    try
+        let ult be sql("SELECT id, estado FROM runs WHERE flujo = ? ORDER BY created DESC LIMIT 1", [fid])
+        when length(ult) > 0
+            let snaps be sql("SELECT nodo, ctx FROM snapshots WHERE run_id = ? ORDER BY created", [ult[0]["id"]])
+            set corrida to "\n\nÚltima corrida (" + ult[0]["id"] + ", estado " + ult[0]["estado"] + "), ctx por nodo:\n" + join(apply((s) => s["nodo"] + ": " + slice(s["ctx"], 0, 400), snaps), "\n")
+    recover e
+        set corrida to ""
+    let prompt be "Sos el builder de Telar (plataforma de automatizaciones sobre Synsema). El usuario pregunta sobre uno de sus flujos. Respondé en español rioplatense, concreto y corto; si detectás un problema, decí qué nodo tocar y qué cambio pedir.\n\nGrafo del flujo:\n" + grafo_txt + "\n\nCódigo compilado:\n" + codigo + corrida + "\n\nPregunta del usuario: " + pregunta
+    let r be preguntar(prompt)
+    give {"ok": true, "respuesta": r}
+
+serve on 7001
+    route "GET /health"
+        give {"service": "telar-builder", "llm": llm_available()}
+
+    route "POST /editar_flujo"
+        expect body {flujo: text, pedido: text}
+        let b be json of request
+        when not llm_available()
+            give fail(503, "builder sin LLM")
+        when not matches(b["flujo"], "[a-z0-9_]+")
+            give fail(400, "id de flujo inválido")
+        when not file_exists("./compilador/grafos/" + b["flujo"] + ".json")
+            give not_found("ese flujo no existe")
+        let forzar be when contains(b, "forzar") then b["forzar"] otherwise false
+        when forzar != true
+            let hallado be util.hallar_credencial(b["pedido"])
+            when hallado != nothing
+                give fail(422, "Encontré algo que parece una credencial: \"" + slice(hallado, 0, 14) + "…\". Si es una key real, cargala en Credenciales; si es un falso positivo, reenviá igual.")
+        log "🧵 editar flujo " + b["flujo"] + ": " + b["pedido"]
+        give editar_flujo(b["flujo"], b["pedido"])
+
+    route "POST /consultar"
+        expect body {flujo: text, pregunta: text}
+        let b be json of request
+        when not llm_available()
+            give fail(503, "builder sin LLM")
+        when not matches(b["flujo"], "[a-z0-9_]+")
+            give fail(400, "id de flujo inválido")
+        when not file_exists("./compilador/grafos/" + b["flujo"] + ".json")
+            give not_found("ese flujo no existe")
+        log "💬 consulta sobre " + b["flujo"] + ": " + b["pregunta"]
+        give consultar(b["flujo"], b["pregunta"])
+
+    route "POST /editar_nodo"
+        expect body {flujo: text, nodo: text, pedido: text}
+        let b be json of request
+        when not llm_available()
+            give fail(503, "builder sin LLM — configurá un provider en telar/.env")
+        when not matches(b["flujo"], "[a-z0-9_]+")
+            give fail(400, "id de flujo inválido")
+        when not file_exists("./compilador/grafos/" + b["flujo"] + ".json")
+            give not_found("ese flujo no existe")
+        let forzar be when contains(b, "forzar") then b["forzar"] otherwise false
+        when forzar != true
+            let hallado be util.hallar_credencial(b["pedido"])
+            when hallado != nothing
+                give fail(422, "Encontré algo que parece una credencial: \"" + slice(hallado, 0, 14) + "…\". Si es una key real, cargala en Credenciales; si es un falso positivo, reenviá igual.")
+        log "✂️ editar nodo " + b["nodo"] + " de " + b["flujo"] + ": " + b["pedido"]
+        give editar_nodo(b["flujo"], b["nodo"], b["pedido"])
+
+    route "POST /pedir"
+        expect body {pedido: text}
+        when not llm_available()
+            give fail(503, "builder sin LLM — configurá un provider en telar/.env")
+        -- El valor de una credencial JAMÁS viaja al modelo. Si parece que
+        -- pegaste una, se frena acá — cargala en el panel Credenciales.
+        let b be json of request
+        let forzar be when contains(b, "forzar") then b["forzar"] otherwise false
+        when forzar != true
+            let hallado be util.hallar_credencial(b["pedido"])
+            when hallado != nothing
+                give fail(422, "Encontré algo que parece una credencial en el pedido: \"" + slice(hallado, 0, 14) + "…\". Si es una key real, NO la mandes al modelo: cargala en el panel Credenciales y nombrala en el pedido. Si es un falso positivo (un id largo, un export de n8n), podés reenviar igual.")
+        let con_ctx be when contains(b, "contexto") then b["contexto"] otherwise true
+        log "📥 pedido: " + b["pedido"]
+        give construir(b["pedido"], con_ctx)

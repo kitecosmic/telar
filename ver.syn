@@ -1,0 +1,15 @@
+-- Telar · ver — inspección rápida de corridas y snapshots:
+--   cd telar && synsema run ver.syn
+
+require db("./telar.db")
+
+db_open("./telar.db")
+print("── runs ──")
+each r in sql("SELECT id, flujo, estado FROM runs ORDER BY created DESC LIMIT 10")
+    print(r["flujo"] + " · run " + r["id"] + " · " + r["estado"])
+print("")
+print("── snapshots de la última run ──")
+let ultimas be sql("SELECT id FROM runs ORDER BY created DESC LIMIT 1")
+when length(ultimas) > 0
+    each s in sql("SELECT nodo, ctx FROM snapshots WHERE run_id = ? ORDER BY created", [ultimas[0]["id"]])
+        print("· " + s["nodo"] + " → " + slice(s["ctx"], 0, 200))
